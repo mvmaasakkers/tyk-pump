@@ -6,26 +6,28 @@ import (
 
 	"gorm.io/gorm"
 
+	"github.com/TykTechnologies/storage/persistent/model"
 	"github.com/fatih/structs"
 )
 
 const UptimeSQLTable = "tyk_uptime_analytics"
 
 type UptimeReportData struct {
-	URL          string     `json:"url"`
-	RequestTime  int64      `json:"request_time"`
-	ResponseCode int        `json:"response_code"`
-	TCPError     bool       `json:"tcp_error"`
-	ServerError  bool       `json:"server_error"`
-	Day          int        `json:"day"`
-	Month        time.Month `json:"month"`
-	Year         int        `json:"year"`
-	Hour         int        `json:"hour"`
-	Minute       int        `json:"minute"`
-	TimeStamp    time.Time  `json:"timestamp"`
-	ExpireAt     time.Time  `bson:"expireAt"`
-	APIID        string     `json:"api_id"`
-	OrgID        string     `json:"org_id"`
+	ID           model.ObjectID `json:"_id" bson:"_id" gorm:"-:all"`
+	URL          string         `json:"url"`
+	RequestTime  int64          `json:"request_time"`
+	ResponseCode int            `json:"response_code"`
+	TCPError     bool           `json:"tcp_error"`
+	ServerError  bool           `json:"server_error"`
+	Day          int            `json:"day"`
+	Month        time.Month     `json:"month"`
+	Year         int            `json:"year"`
+	Hour         int            `json:"hour"`
+	Minute       int            `json:"minute"`
+	TimeStamp    time.Time      `json:"timestamp"`
+	ExpireAt     time.Time      `bson:"expireAt"`
+	APIID        string         `json:"api_id"`
+	OrgID        string         `json:"org_id"`
 }
 
 type UptimeReportAggregateSQL struct {
@@ -45,7 +47,19 @@ func (a *UptimeReportAggregateSQL) TableName() string {
 	return UptimeSQLTable
 }
 
-func OnConflictUptimeAssignments(tableName string, tempTable string) map[string]interface{} {
+func (a *UptimeReportData) GetObjectID() model.ObjectID {
+	return a.ID
+}
+
+func (a *UptimeReportData) SetObjectID(id model.ObjectID) {
+	a.ID = id
+}
+
+func (a *UptimeReportData) TableName() string {
+	return UptimeSQLTable
+}
+
+func OnConflictUptimeAssignments(tableName, tempTable string) map[string]interface{} {
 	assignments := make(map[string]interface{})
 	f := UptimeReportAggregateSQL{}
 	baseFields := structs.Fields(f.Code)
@@ -172,6 +186,7 @@ func AggregateUptimeData(data []UptimeReportData) map[string]UptimeReportAggrega
 				TotalRequestTime: float64(thisV.RequestTime),
 				LastTime:         thisV.TimeStamp,
 				ErrorMap:         make(map[string]int),
+				ErrorList:        []ErrorData{},
 			}
 			thisAggregate.Total.Hits++
 			thisAggregate.Total.TotalRequestTime += float64(thisV.RequestTime)
@@ -188,7 +203,7 @@ func AggregateUptimeData(data []UptimeReportData) map[string]UptimeReportAggrega
 			if (thisV.ResponseCode < 300) && (thisV.ResponseCode >= 200) {
 				thisCounter.Success = 1
 				thisAggregate.Total.Success++
-				//using the errorMap as ResponseCode Map for SQL purpose
+				// using the errorMap as ResponseCode Map for SQL purpose
 				thisCounter.ErrorMap[strconv.Itoa(thisV.ResponseCode)]++
 				thisAggregate.Total.ErrorMap[strconv.Itoa(thisV.ResponseCode)]++
 			}

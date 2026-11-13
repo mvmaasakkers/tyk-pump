@@ -16,9 +16,9 @@ import (
 	elasticv5 "gopkg.in/olivere/elastic.v5"
 	elasticv6 "gopkg.in/olivere/elastic.v6"
 
-	"github.com/TykTechnologies/logrus"
 	"github.com/TykTechnologies/murmur3"
 	"github.com/TykTechnologies/tyk-pump/analytics"
+	"github.com/sirupsen/logrus"
 )
 
 type ElasticsearchPump struct {
@@ -27,33 +27,96 @@ type ElasticsearchPump struct {
 	CommonPumpConfig
 }
 
-var elasticsearchPrefix = "elasticsearch-pump"
-var elasticsearchDefaultENV = PUMPS_ENV_PREFIX + "_ELASTICSEARCH" + PUMPS_ENV_META_PREFIX
+var (
+	elasticsearchPrefix     = "elasticsearch-pump"
+	elasticsearchDefaultENV = PUMPS_ENV_PREFIX + "_ELASTICSEARCH" + PUMPS_ENV_META_PREFIX
+)
 
+const (
+	// esMCPMethod is the Elasticsearch field name for the MCP JSON-RPC method.
+	esMCPMethod = "mcp_method"
+	// esMCPPrimitiveType is the Elasticsearch field name for the MCP primitive type.
+	esMCPPrimitiveType = "mcp_primitive_type"
+	// esMCPPrimitiveName is the Elasticsearch field name for the MCP primitive name.
+	esMCPPrimitiveName = "mcp_primitive_name"
+	// esMCPEffectiveProtocolVersion is the normalized version used to handle the MCP request.
+	esMCPEffectiveProtocolVersion = "effective_protocol_version"
+	// esMCPDeclaredProtocolVersion is the version agreed by the request declarations.
+	esMCPDeclaredProtocolVersion = "declared_protocol_version"
+	// esMCPProtocolVersionSource describes how the effective version was selected.
+	esMCPProtocolVersionSource = "protocol_version_source"
+	// esMCPJSONRPCErrorCode is the signed top-level JSON-RPC error code.
+	esMCPJSONRPCErrorCode = "jsonrpc_error_code"
+)
+
+// @PumpConf Elasticsearch
 type ElasticsearchConf struct {
-	EnvPrefix          string                  `mapstructure:"meta_env_prefix"`
-	IndexName          string                  `mapstructure:"index_name"`
-	ElasticsearchURL   string                  `mapstructure:"elasticsearch_url"`
-	EnableSniffing     bool                    `mapstructure:"use_sniffing"`
-	DocumentType       string                  `mapstructure:"document_type"`
-	RollingIndex       bool                    `mapstructure:"rolling_index"`
-	ExtendedStatistics bool                    `mapstructure:"extended_stats"`
-	GenerateID         bool                    `mapstructure:"generate_id"`
-	DecodeBase64       bool                    `mapstructure:"decode_base64"`
-	Version            string                  `mapstructure:"version"`
-	DisableBulk        bool                    `mapstructure:"disable_bulk"`
-	BulkConfig         ElasticsearchBulkConfig `mapstructure:"bulk_config"`
-	AuthAPIKeyID       string                  `mapstructure:"auth_api_key_id"`
-	AuthAPIKey         string                  `mapstructure:"auth_api_key"`
-	Username           string                  `mapstructure:"auth_basic_username"`
-	Password           string                  `mapstructure:"auth_basic_password"`
+	// The prefix for the environment variables that will be used to override the configuration.
+	// Defaults to `TYK_PMP_PUMPS_ELASTICSEARCH_META`
+	EnvPrefix string `mapstructure:"meta_env_prefix"`
+	// The name of the index that all the analytics data will be placed in. Defaults to
+	// "tyk_analytics".
+	IndexName string `json:"index_name" mapstructure:"index_name"`
+	// If sniffing is disabled, the URL that all data will be sent to. Defaults to
+	// "http://localhost:9200".
+	ElasticsearchURL string `json:"elasticsearch_url" mapstructure:"elasticsearch_url"`
+	// If sniffing is enabled, the "elasticsearch_url" will be used to make a request to get a
+	// list of all the nodes in the cluster, the returned addresses will then be used. Defaults to
+	// `false`.
+	EnableSniffing bool `json:"use_sniffing" mapstructure:"use_sniffing"`
+	// The type of the document that is created in ES. Defaults to "tyk_analytics".
+	DocumentType string `json:"document_type" mapstructure:"document_type"`
+	// Appends the date to the end of the index name, so each days data is split into a different
+	// index name. E.g. tyk_analytics-2016.02.28. Defaults to `false`.
+	RollingIndex bool `json:"rolling_index" mapstructure:"rolling_index"`
+	// If set to `true` will include the following additional fields: Raw Request, Raw Response and
+	// User Agent.
+	ExtendedStatistics bool `json:"extended_stats" mapstructure:"extended_stats"`
+	// When enabled, generate _id for outgoing records. This prevents duplicate records when
+	// retrying ES.
+	GenerateID bool `json:"generate_id" mapstructure:"generate_id"`
+	// Allows for the base64 bits to be decode before being passed to ES.
+	DecodeBase64 bool `json:"decode_base64" mapstructure:"decode_base64"`
+	// Specifies the ES version. Use "3" for ES 3.X, "5" for ES 5.X, "6" for ES 6.X, "7" for ES
+	// 7.X . Defaults to "3".
+	Version string `json:"version" mapstructure:"version"`
+	// Disable batch writing. Defaults to false.
+	DisableBulk bool `json:"disable_bulk" mapstructure:"disable_bulk"`
+	// Batch writing trigger configuration. Each option is an OR with eachother:
+	BulkConfig ElasticsearchBulkConfig `json:"bulk_config" mapstructure:"bulk_config"`
+	// API Key ID used for APIKey auth in ES. It's send to ES in the Authorization header as ApiKey base64(auth_api_key_id:auth_api_key)
+	AuthAPIKeyID string `json:"auth_api_key_id" mapstructure:"auth_api_key_id"`
+	// API Key used for APIKey auth in ES. It's send to ES in the Authorization header as ApiKey base64(auth_api_key_id:auth_api_key)
+	AuthAPIKey string `json:"auth_api_key" mapstructure:"auth_api_key"`
+	// Basic auth username. It's send to ES in the Authorization header as username:password encoded in base64.
+	Username string `json:"auth_basic_username" mapstructure:"auth_basic_username"`
+	// Basic auth password. It's send to ES in the Authorization header as username:password encoded in base64.
+	Password string `json:"auth_basic_password" mapstructure:"auth_basic_password"`
+	// Enables SSL connection.
+	UseSSL bool `json:"use_ssl" mapstructure:"use_ssl"`
+	// Controls whether the pump client verifies the Elastic Search server's certificate chain and hostname.
+	SSLInsecureSkipVerify bool `json:"ssl_insecure_skip_verify" mapstructure:"ssl_insecure_skip_verify"`
+	// Can be used to set custom certificate file for authentication with Elastic Search.
+	SSLCertFile string `json:"ssl_cert_file" mapstructure:"ssl_cert_file"`
+	// Can be used to set custom key file for authentication with Elastic Search.
+	SSLKeyFile string `json:"ssl_key_file" mapstructure:"ssl_key_file"`
+	// Path to the PEM file with trusted CA certificates that will be used to verify the Elasticsearch server's certificate.
+	SSLCAFile string `json:"ssl_ca_file" mapstructure:"ssl_ca_file"`
+	// When set, Model Context Protocol (MCP) records are written to this index instead of the default `IndexName`. Supports the same rolling-index date suffix as `IndexName` when `RollingIndex` is enabled. Defaults to `""` (empty string), meaning all records go to `IndexName`.
+	MCPIndexName string `json:"mcp_index_name" mapstructure:"mcp_index_name"`
 }
 
 type ElasticsearchBulkConfig struct {
-	Workers       int `mapstructure:"workers"`
-	FlushInterval int `mapstructure:"flush_interval"`
-	BulkActions   int `mapstructure:"bulk_actions"`
-	BulkSize      int `mapstructure:"bulk_size"`
+	// Number of workers. Defaults to 1.
+	Workers int `json:"workers" mapstructure:"workers"`
+	// Specifies the time in seconds to flush the data and send it to ES. Default disabled.
+	FlushInterval int `json:"flush_interval" mapstructure:"flush_interval"`
+	// Specifies the number of requests needed to flush the data and send it to ES. Defaults to
+	// 1000 requests. If it is needed, can be disabled with -1.
+	BulkActions int `json:"bulk_actions" mapstructure:"bulk_actions"`
+	// Specifies the size (in bytes) needed to flush the data and send it to ES. Defaults to 5MB.
+	// If it is needed, can be disabled with -1.
+	BulkSize int `json:"bulk_size" mapstructure:"bulk_size"`
 }
 
 type ElasticsearchOperator interface {
@@ -90,7 +153,7 @@ type ApiKeyTransport struct {
 	APIKeyID string
 }
 
-//RoundTrip for ApiKeyTransport auth
+// RoundTrip for ApiKeyTransport auth
 func (t *ApiKeyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	auth := t.APIKeyID + ":" + t.APIKey
 	key := base64.StdEncoding.EncodeToString([]byte(auth))
@@ -113,11 +176,23 @@ func (e *ElasticsearchPump) getOperator() (ElasticsearchOperator, error) {
 		httpClient = &http.Client{Transport: &ApiKeyTransport{APIKey: conf.AuthAPIKey, APIKeyID: conf.AuthAPIKeyID}}
 	}
 
+	if conf.UseSSL {
+		tlsConf, err := NewTLSConfig(TLSConfig{
+			CertFile:           conf.SSLCertFile,
+			KeyFile:            conf.SSLKeyFile,
+			CAFile:             conf.SSLCAFile,
+			InsecureSkipVerify: conf.SSLInsecureSkipVerify,
+		}, e.log)
+		if err != nil {
+			return nil, fmt.Errorf("failed to configure TLS for Elasticsearch connection: %w", err)
+		}
+		httpClient = &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConf}}
+	}
+
 	switch conf.Version {
 	case "3":
 		op := new(Elasticsearch3Operator)
 		op.esClient, err = elasticv3.NewClient(elasticv3.SetURL(urls...), elasticv3.SetSniff(conf.EnableSniffing), elasticv3.SetBasicAuth(conf.Username, conf.Password), elasticv3.SetHttpClient(httpClient))
-
 		if err != nil {
 			return op, err
 		}
@@ -155,7 +230,6 @@ func (e *ElasticsearchPump) getOperator() (ElasticsearchOperator, error) {
 		op := new(Elasticsearch5Operator)
 
 		op.esClient, err = elasticv5.NewClient(elasticv5.SetURL(urls...), elasticv5.SetSniff(conf.EnableSniffing), elasticv5.SetBasicAuth(conf.Username, conf.Password), elasticv5.SetHttpClient(httpClient))
-
 		if err != nil {
 			return op, err
 		}
@@ -192,7 +266,6 @@ func (e *ElasticsearchPump) getOperator() (ElasticsearchOperator, error) {
 		op := new(Elasticsearch6Operator)
 
 		op.esClient, err = elasticv6.NewClient(elasticv6.SetURL(urls...), elasticv6.SetSniff(conf.EnableSniffing), elasticv6.SetBasicAuth(conf.Username, conf.Password), elasticv6.SetHttpClient(httpClient))
-
 		if err != nil {
 			return op, err
 		}
@@ -229,7 +302,6 @@ func (e *ElasticsearchPump) getOperator() (ElasticsearchOperator, error) {
 		op := new(Elasticsearch7Operator)
 
 		op.esClient, err = elasticv7.NewClient(elasticv7.SetURL(urls...), elasticv7.SetSniff(conf.EnableSniffing), elasticv7.SetBasicAuth(conf.Username, conf.Password), elasticv7.SetHttpClient(httpClient))
-
 		if err != nil {
 			return op, err
 		}
@@ -312,11 +384,11 @@ func (e *ElasticsearchPump) Init(config interface{}) error {
 		log.Info("Version not specified, defaulting to 3. If you are importing to Elasticsearch 5, please specify \"version\" = \"5\"")
 	case "3", "5", "6", "7":
 	default:
-		err := errors.New("Only 3, 5, 6 are valid values for this field")
+		err := errors.New("Only 3, 5, 6, 7 are valid values for this field")
 		e.log.Fatal("Invalid version: ", err)
 	}
 
-	var re = regexp.MustCompile(`(.*)\/\/(.*):(.*)\@(.*)`)
+	re := regexp.MustCompile(`(.*)\/\/(.*):(.*)\@(.*)`)
 	printableURL := re.ReplaceAllString(e.esConf.ElasticsearchURL, `$1//***:***@$4`)
 
 	e.log.Info("Elasticsearch URL: ", printableURL)
@@ -362,13 +434,28 @@ func getIndexName(esConf *ElasticsearchConf) string {
 
 	if esConf.RollingIndex {
 		currentTime := time.Now()
-		//This formats the date to be YYYY.MM.DD but Golang makes you use a specific date for its date formatting
+		// This formats the date to be YYYY.MM.DD but Golang makes you use a specific date for its date formatting
 		indexName += "-" + currentTime.Format("2006.01.02")
 	}
 	return indexName
 }
 
-func getMapping(datum analytics.AnalyticsRecord, extendedStatistics bool, generateID bool, decodeBase64 bool) (map[string]interface{}, string) {
+// getIndexNameForRecord returns the ES index to write a single record to.
+// When MCPIndexName is set and the record is an MCP record, the MCP index is
+// returned (with date suffix when RollingIndex is enabled). Otherwise the
+// standard index is returned, preserving backward-compatible behaviour.
+func getIndexNameForRecord(esConf *ElasticsearchConf, record analytics.AnalyticsRecord) string {
+	if esConf.MCPIndexName != "" && record.IsMCPRecord() {
+		indexName := esConf.MCPIndexName
+		if esConf.RollingIndex {
+			indexName += "-" + time.Now().Format("2006.01.02")
+		}
+		return indexName
+	}
+	return getIndexName(esConf)
+}
+
+func getMapping(datum analytics.AnalyticsRecord, extendedStatistics, generateID, decodeBase64 bool) (map[string]interface{}, string) {
 	record := datum
 
 	mapping := map[string]interface{}{
@@ -403,6 +490,16 @@ func getMapping(datum analytics.AnalyticsRecord, extendedStatistics bool, genera
 		mapping["user_agent"] = record.UserAgent
 	}
 
+	if datum.IsMCPRecord() {
+		mapping[esMCPJSONRPCErrorCode] = record.MCPStats.JSONRPCErrorCode
+		mapping[esMCPMethod] = record.MCPStats.JSONRPCMethod
+		mapping[esMCPPrimitiveType] = record.MCPStats.PrimitiveType
+		mapping[esMCPPrimitiveName] = record.MCPStats.PrimitiveName
+		mapping[esMCPEffectiveProtocolVersion] = record.MCPStats.EffectiveProtocolVersion
+		mapping[esMCPDeclaredProtocolVersion] = record.MCPStats.DeclaredProtocolVersion
+		mapping[esMCPProtocolVersionSource] = record.MCPStats.ProtocolVersionSource
+	}
+
 	if generateID {
 		hasher := murmur3.New64()
 		hasher.Write([]byte(fmt.Sprintf("%d%s%s%s%s%s%d%s", record.TimeStamp.UnixNano(), record.Method, record.Path, record.IPAddress, record.APIID, record.OauthID, record.RequestTime, record.Alias)))
@@ -428,9 +525,10 @@ func (e Elasticsearch3Operator) processData(ctx context.Context, data []interfac
 		}
 
 		mapping, id := getMapping(d, esConf.ExtendedStatistics, esConf.GenerateID, esConf.DecodeBase64)
+		recordIndex := getIndexNameForRecord(esConf, d)
 
 		if !esConf.DisableBulk {
-			r := elasticv3.NewBulkIndexRequest().Index(getIndexName(esConf)).Type(esConf.DocumentType).Id(id).Doc(mapping)
+			r := elasticv3.NewBulkIndexRequest().Index(recordIndex).Type(esConf.DocumentType).Id(id).Doc(mapping)
 			e.bulkProcessor.Add(r)
 		} else {
 			_, err := index.BodyJson(mapping).Type(esConf.DocumentType).Id(id).DoC(ctx)
@@ -464,9 +562,10 @@ func (e Elasticsearch5Operator) processData(ctx context.Context, data []interfac
 		}
 
 		mapping, id := getMapping(d, esConf.ExtendedStatistics, esConf.GenerateID, esConf.DecodeBase64)
+		recordIndex := getIndexNameForRecord(esConf, d)
 
 		if !esConf.DisableBulk {
-			r := elasticv5.NewBulkIndexRequest().Index(getIndexName(esConf)).Type(esConf.DocumentType).Id(id).Doc(mapping)
+			r := elasticv5.NewBulkIndexRequest().Index(recordIndex).Type(esConf.DocumentType).Id(id).Doc(mapping)
 			e.bulkProcessor.Add(r)
 		} else {
 			_, err := index.BodyJson(mapping).Type(esConf.DocumentType).Id(id).Do(ctx)
@@ -500,9 +599,10 @@ func (e Elasticsearch6Operator) processData(ctx context.Context, data []interfac
 		}
 
 		mapping, id := getMapping(d, esConf.ExtendedStatistics, esConf.GenerateID, esConf.DecodeBase64)
+		recordIndex := getIndexNameForRecord(esConf, d)
 
 		if !esConf.DisableBulk {
-			r := elasticv6.NewBulkIndexRequest().Index(getIndexName(esConf)).Type(esConf.DocumentType).Id(id).Doc(mapping)
+			r := elasticv6.NewBulkIndexRequest().Index(recordIndex).Type(esConf.DocumentType).Id(id).Doc(mapping)
 			e.bulkProcessor.Add(r)
 		} else {
 			_, err := index.BodyJson(mapping).Type(esConf.DocumentType).Id(id).Do(ctx)
@@ -540,9 +640,10 @@ func (e Elasticsearch7Operator) processData(ctx context.Context, data []interfac
 		}
 
 		mapping, id := getMapping(d, esConf.ExtendedStatistics, esConf.GenerateID, esConf.DecodeBase64)
+		recordIndex := getIndexNameForRecord(esConf, d)
 
 		if !esConf.DisableBulk {
-			r := elasticv7.NewBulkIndexRequest().Index(getIndexName(esConf)).Id(id).Doc(mapping)
+			r := elasticv7.NewBulkIndexRequest().Index(recordIndex).Id(id).Doc(mapping)
 			e.bulkProcessor.Add(r)
 		} else {
 			_, err := index.BodyJson(mapping).Id(id).Do(ctx)

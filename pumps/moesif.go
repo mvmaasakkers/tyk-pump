@@ -6,11 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/TykTechnologies/logrus"
-	"github.com/TykTechnologies/tyk-pump/analytics"
-	"github.com/mitchellh/mapstructure"
-	"github.com/moesif/moesifapi-go"
-	"github.com/moesif/moesifapi-go/models"
 	"io/ioutil"
 	"math"
 	"math/rand"
@@ -18,6 +13,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/TykTechnologies/tyk-pump/analytics"
+	"github.com/mitchellh/mapstructure"
+	"github.com/moesif/moesifapi-go"
+	"github.com/moesif/moesifapi-go/models"
+	"github.com/sirupsen/logrus"
 )
 
 type MoesifPump struct {
@@ -42,21 +43,51 @@ type rawDecoded struct {
 var moesifPrefix = "moesif-pump"
 var moesifDefaultENV = PUMPS_ENV_PREFIX + "_MOESIF" + PUMPS_ENV_META_PREFIX
 
+// @PumpConf Moesif
 type MoesifConf struct {
-	EnvPrefix                  string                 `mapstructure:"meta_env_prefix"`
-	ApplicationID              string                 `mapstructure:"application_id"`
-	RequestHeaderMasks         []string               `mapstructure:"request_header_masks"`
-	ResponseHeaderMasks        []string               `mapstructure:"response_header_masks"`
-	RequestBodyMasks           []string               `mapstructure:"request_body_masks"`
-	ResponseBodyMasks          []string               `mapstructure:"response_body_masks"`
-	DisableCaptureRequestBody  bool                   `mapstructure:"disable_capture_request_body"`
-	DisableCaptureResponseBody bool                   `mapstructure:"disable_capture_response_body"`
-	UserIDHeader               string                 `mapstructure:"user_id_header"`
-	CompanyIDHeader            string                 `mapstructure:"company_id_header"`
-	EnableBulk                 bool                   `mapstructure:"enable_bulk"`
-	BulkConfig                 map[string]interface{} `mapstructure:"bulk_config"`
-	AuthorizationHeaderName    string                 `mapstructure:"authorization_header_name"`
-	AuthorizationUserIdField   string                 `mapstructure:"authorization_user_id_field"`
+	// The prefix for the environment variables that will be used to override the configuration.
+	// Defaults to `TYK_PMP_PUMPS_MOESIF_META`
+	EnvPrefix string `mapstructure:"meta_env_prefix"`
+	// Moesif Application Id. You can find your Moesif Application Id from
+	// [_Moesif Dashboard_](https://www.moesif.com/) -> _Top Right Menu_ -> _API Keys_ . Moesif
+	// recommends creating separate Application Ids for each environment such as Production,
+	// Staging, and Development to keep data isolated.
+	ApplicationID string `json:"application_id" mapstructure:"application_id"`
+	// An option to mask a specific request header field.
+	RequestHeaderMasks []string `json:"request_header_masks" mapstructure:"request_header_masks"`
+	// An option to mask a specific response header field.
+	ResponseHeaderMasks []string `json:"response_header_masks" mapstructure:"response_header_masks"`
+	// An option to mask a specific - request body field.
+	RequestBodyMasks []string `json:"request_body_masks" mapstructure:"request_body_masks"`
+	// An option to mask a specific response body field.
+	ResponseBodyMasks []string `json:"response_body_masks" mapstructure:"response_body_masks"`
+	// An option to disable logging of request body. Default value is `false`.
+	DisableCaptureRequestBody bool `json:"disable_capture_request_body" mapstructure:"disable_capture_request_body"`
+	// An option to disable logging of response body. Default value is `false`.
+	DisableCaptureResponseBody bool `json:"disable_capture_response_body" mapstructure:"disable_capture_response_body"`
+	// An optional field name to identify User from a request or response header.
+	UserIDHeader string `json:"user_id_header" mapstructure:"user_id_header"`
+	// An optional field name to identify Company (Account) from a request or response header.
+	CompanyIDHeader string `json:"company_id_header" mapstructure:"company_id_header"`
+	// Set this to `true` to enable `bulk_config`.
+	EnableBulk bool `json:"enable_bulk" mapstructure:"enable_bulk"`
+	// Batch writing trigger configuration.
+	//   * `"event_queue_size"` - (optional) An optional field name which specify the maximum
+	// number of events to hold in queue before sending to Moesif. In case of network issues when
+	// not able to connect/send event to Moesif, skips adding new events to the queue to prevent
+	// memory overflow. Type: int. Default value is `10000`.
+	//   * `"batch_size"` - (optional) An optional field name which specify the maximum batch size
+	// when sending to Moesif. Type: int. Default value is `200`.
+	//   * `"timer_wake_up_seconds"` - (optional) An optional field which specifies a time (every n
+	// seconds) how often background thread runs to send events to moesif. Type: int. Default value
+	// is `2` seconds.
+	BulkConfig map[string]interface{} `json:"bulk_config" mapstructure:"bulk_config"`
+	// An optional request header field name to used to identify the User in Moesif. Default value
+	// is `authorization`.
+	AuthorizationHeaderName string `json:"authorization_header_name" mapstructure:"authorization_header_name"`
+	// An optional field name use to parse the User from authorization header in Moesif. Default
+	// value is `sub`.
+	AuthorizationUserIdField string `json:"authorization_user_id_field" mapstructure:"authorization_user_id_field"`
 }
 
 func (p *MoesifPump) New() Pump {
@@ -135,10 +166,10 @@ func (p *MoesifPump) getSamplingPercentage(userID string, companyID string) int 
 
 func fetchIDFromHeader(requestHeaders map[string]interface{}, responseHeaders map[string]interface{}, headerName string) string {
 	var id string
-	if requid, ok := requestHeaders[headerName].(string); ok {
+	if requid, ok := requestHeaders[strings.ToLower(headerName)].(string); ok {
 		id = requid
 	}
-	if resuid, ok := responseHeaders[headerName].(string); ok {
+	if resuid, ok := responseHeaders[strings.ToLower(headerName)].(string); ok {
 		id = resuid
 	}
 	return id
@@ -533,4 +564,12 @@ func (p *MoesifPump) SetTimeout(timeout int) {
 
 func (p *MoesifPump) GetTimeout() int {
 	return p.timeout
+}
+
+func (p *MoesifPump) Shutdown() error {
+	if p.moesifConf.EnableBulk {
+		p.log.Info("Flushing bulked records...")
+		p.moesifAPI.Flush()
+	}
+	return nil
 }

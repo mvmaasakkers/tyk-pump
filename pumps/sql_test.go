@@ -2,19 +2,40 @@ package pumps
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/TykTechnologies/tyk-pump/analytics"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/vmihailenco/msgpack.v2"
 )
 
-func TestSQLInit(t *testing.T) {
-	pmp := SQLPump{}
+func getTestPostgresConnectionString() string {
+	return os.Getenv("TYK_TEST_POSTGRES")
+}
+
+func skipTestIfNoPostgres(t *testing.T) {
+	t.Helper()
+	if os.Getenv("TYK_TEST_POSTGRES") == "" {
+		t.Skip("Skipping test because TYK_TEST_POSTGRES environment variable is not set")
+	}
+}
+
+func newSQLConfig(sharded bool) map[string]interface{} {
 	cfg := make(map[string]interface{})
-	cfg["type"] = "sqlite"
-	cfg["connection_string"] = ""
+	cfg["type"] = "postgres"
+	cfg["connection_string"] = getTestPostgresConnectionString()
+	cfg["table_sharding"] = sharded
+	return cfg
+}
+
+func TestSQLInit(t *testing.T) {
+	skipTestIfNoPostgres(t)
+	pmp := SQLPump{}
+	cfg := newSQLConfig(false)
 
 	err := pmp.Init(cfg)
 	if err != nil {
@@ -25,21 +46,19 @@ func TestSQLInit(t *testing.T) {
 	}()
 
 	assert.NotNil(t, pmp.db)
-	assert.Equal(t, "sqlite", pmp.db.Dialector.Name())
+	assert.Equal(t, "postgres", pmp.db.Dialector.Name())
 
-	//Checking with invalid type
+	// Checking with invalid type
 	cfg["type"] = "invalid"
 	pmp2 := SQLPump{}
 	invalidDialectErr := pmp2.Init(cfg)
 	assert.NotNil(t, invalidDialectErr)
-
 }
 
 func TestSQLWriteData(t *testing.T) {
+	skipTestIfNoPostgres(t)
 	pmp := SQLPump{}
-	cfg := make(map[string]interface{})
-	cfg["type"] = "sqlite"
-	cfg["connection_string"] = ""
+	cfg := newSQLConfig(false)
 
 	err := pmp.Init(cfg)
 	if err != nil {
@@ -69,7 +88,6 @@ func TestSQLWriteData(t *testing.T) {
 		err := pmp.db.Table(table).Find(&dbRecords).Error
 		assert.Nil(t, err)
 		assert.Equal(t, 3, len(dbRecords))
-
 	})
 
 	t.Run("table_content", func(t *testing.T) {
@@ -85,14 +103,12 @@ func TestSQLWriteData(t *testing.T) {
 			assert.Equal(t, keys[i].(analytics.AnalyticsRecord).OrgID, dbRecords[i].OrgID)
 		}
 	})
-
 }
 
 func TestSQLWriteDataSharded(t *testing.T) {
+	skipTestIfNoPostgres(t)
 	pmp := SQLPump{}
-	cfg := make(map[string]interface{})
-	cfg["type"] = "sqlite"
-	cfg["table_sharding"] = true
+	cfg := newSQLConfig(true)
 	cfg["batch_size"] = 20000
 
 	err := pmp.Init(cfg)
@@ -150,14 +166,31 @@ func TestSQLWriteDataSharded(t *testing.T) {
 		})
 	}
 
+	t.Run("empty_keys", func(t *testing.T) {
+		emptyKeys := make([]interface{}, 0)
+		errWrite := pmp.WriteData(context.Background(), emptyKeys)
+		if errWrite != nil {
+			t.Fatal("SQL Pump couldn't write records with err:", errWrite)
+		}
+
+		// Check if any table has been created for the empty input case
+		tables := []string{
+			analytics.SQLTable + "_" + now.Format("20060102"),
+			analytics.SQLTable + "_" + nowPlus1.Format("20060102"),
+			analytics.SQLTable + "_" + nowPlus2.Format("20060102"),
+		}
+		for _, table := range tables {
+			t.Run("checking_"+table, func(t *testing.T) {
+				assert.Equal(t, false, pmp.db.Migrator().HasTable(table)) // No table should exist
+			})
+		}
+	})
 }
 
 func TestSQLWriteUptimeData(t *testing.T) {
+	skipTestIfNoPostgres(t)
 	pmp := SQLPump{IsUptime: true}
-	cfg := make(map[string]interface{})
-	cfg["type"] = "sqlite"
-	cfg["connection_string"] = ""
-	cfg["table_sharding"] = false
+	cfg := newSQLConfig(false)
 	err := pmp.Init(cfg)
 	if err != nil {
 		t.Fatal("SQL Pump couldn't be initialized with err: ", err)
@@ -197,7 +230,7 @@ func TestSQLWriteUptimeData(t *testing.T) {
 			Record:               analytics.UptimeReportData{OrgID: "1", URL: "url1", TimeStamp: nowPlus1},
 			RecordsAmountToWrite: 3,
 			RowsLen:              4,
-			HitsPerHour:          3, //since we're going to write in a new hour, it should mean a different aggregation.
+			HitsPerHour:          3, // since we're going to write in a new hour, it should mean a different aggregation.
 		},
 	}
 
@@ -207,7 +240,7 @@ func TestSQLWriteUptimeData(t *testing.T) {
 		t.Run(testName, func(t *testing.T) {
 			pmp := pmp
 			keys := []interface{}{}
-			//encode the records in the way uptime pump consume them
+			// encode the records in the way uptime pump consume them
 			for i := 0; i < tests[testName].RecordsAmountToWrite; i++ {
 				encoded, _ := msgpack.Marshal(tests[testName].Record)
 				keys = append(keys, string(encoded))
@@ -215,7 +248,7 @@ func TestSQLWriteUptimeData(t *testing.T) {
 
 			pmp.WriteUptimeData(keys)
 			table := analytics.UptimeSQLTable
-			//check if the table exists
+			// check if the table exists
 			assert.Equal(t, true, pmp.db.Migrator().HasTable(table))
 
 			dbRecords := []analytics.UptimeReportAggregateSQL{}
@@ -223,27 +256,24 @@ func TestSQLWriteUptimeData(t *testing.T) {
 				t.Fatal("Error getting analytics records from SQL")
 			}
 
-			//check amount of rows in the table
+			// check amount of rows in the table
 			assert.Equal(t, tests[testName].RowsLen, len(dbRecords))
 
-			//iterate over the records and check total of hits
+			// iterate over the records and check total of hits
 			for _, dbRecord := range dbRecords {
 				if dbRecord.TimeStamp == tests[testName].Record.TimeStamp.Unix() && dbRecord.DimensionValue == "total" {
 					assert.Equal(t, tests[testName].HitsPerHour, dbRecord.Hits)
 					break
 				}
 			}
-
 		})
 	}
 }
 
 func TestSQLWriteUptimeDataSharded(t *testing.T) {
+	skipTestIfNoPostgres(t)
 	pmp := SQLPump{}
-	cfg := make(map[string]interface{})
-	cfg["type"] = "sqlite"
-	cfg["connection_string"] = ""
-	cfg["table_sharding"] = true
+	cfg := newSQLConfig(true)
 	err := pmp.Init(cfg)
 	if err != nil {
 		t.Fatal("SQL Pump couldn't be initialized with err: ", err)
@@ -298,15 +328,12 @@ func TestSQLWriteUptimeDataSharded(t *testing.T) {
 			assert.Equal(t, data.RowsLen, len(dbRecords))
 		})
 	}
-
 }
 
 func TestSQLWriteUptimeDataAggregations(t *testing.T) {
+	skipTestIfNoPostgres(t)
 	pmp := SQLPump{IsUptime: true}
-	cfg := make(map[string]interface{})
-	cfg["type"] = "sqlite"
-	cfg["connection_string"] = ""
-	cfg["table_sharding"] = false
+	cfg := newSQLConfig(false)
 	err := pmp.Init(cfg)
 	if err != nil {
 		t.Fatal("SQL Pump couldn't be initialized with err: ", err)
@@ -337,14 +364,208 @@ func TestSQLWriteUptimeDataAggregations(t *testing.T) {
 	}
 
 	assert.Len(t, dbRecords, 3)
-	assert.Equal(t, "url", dbRecords[0].Dimension)
-	assert.Equal(t, "url1", dbRecords[0].DimensionValue)
-	assert.Equal(t, 3, dbRecords[0].Code200)
-	assert.Equal(t, 2, dbRecords[0].Code500)
-	assert.Equal(t, 5, dbRecords[0].Hits)
-	assert.Equal(t, 3, dbRecords[0].Success)
-	assert.Equal(t, 2, dbRecords[0].ErrorTotal)
-	assert.Equal(t, 14.0, dbRecords[0].RequestTime)
-	assert.Equal(t, 70.0, dbRecords[0].TotalRequestTime)
 
+	// Find the row under test by dimension rather than by position. Find() has
+	// no ORDER BY, so the result order follows insertion order, and the pump
+	// sorts each batch by ID before upserting (TT-9424).
+	var urlRec *analytics.UptimeReportAggregateSQL
+	for i := range dbRecords {
+		if dbRecords[i].Dimension == "url" {
+			urlRec = &dbRecords[i]
+			break
+		}
+	}
+	if !assert.NotNil(t, urlRec, `expected a record with dimension "url"`) {
+		return
+	}
+
+	assert.Equal(t, "url1", urlRec.DimensionValue)
+	assert.Equal(t, 3, urlRec.Code200)
+	assert.Equal(t, 2, urlRec.Code500)
+	assert.Equal(t, 5, urlRec.Hits)
+	assert.Equal(t, 3, urlRec.Success)
+	assert.Equal(t, 2, urlRec.ErrorTotal)
+	assert.Equal(t, 14.0, urlRec.RequestTime)
+	assert.Equal(t, 70.0, urlRec.TotalRequestTime)
+}
+
+func TestDecodeRequestAndDecodeResponseSQL(t *testing.T) {
+	skipTestIfNoPostgres(t)
+	newPump := &SQLPump{}
+	cfg := newSQLConfig(true)
+	err := newPump.Init(cfg)
+	assert.Nil(t, err)
+
+	// checking if the default values are false
+	assert.False(t, newPump.GetDecodedRequest())
+	assert.False(t, newPump.GetDecodedResponse())
+
+	// trying to set the values to true
+	newPump.SetDecodingRequest(true)
+	newPump.SetDecodingResponse(true)
+
+	// checking if the values are still false as expected because this pump doesn't support decoding requests/responses
+	assert.False(t, newPump.GetDecodedRequest())
+	assert.False(t, newPump.GetDecodedResponse())
+}
+
+func setupSQLPump(t *testing.T, tableName string, useBackground bool) *SQLPump {
+	skipTestIfNoPostgres(t)
+	t.Helper()
+	pmp := &SQLPump{}
+	pmp.log = log.WithField("prefix", "sql-pump")
+	cfg := map[string]interface{}{
+		"type":              "postgres",
+		"connection_string": getTestPostgresConnectionString(),
+	}
+
+	assert.NoError(t, pmp.Init(cfg))
+	if useBackground {
+		pmp.backgroundIndexCreated = make(chan bool, 1)
+	}
+	assert.NoError(t, pmp.ensureTable(tableName))
+
+	return pmp
+}
+
+func TestEnsureIndexSQL(t *testing.T) {
+	skipTestIfNoPostgres(t)
+	//nolint:govet
+	tcs := []struct {
+		testName             string
+		givenTableName       string
+		expectedErr          error
+		pmpSetupFn           func(t *testing.T, tableName string) *SQLPump
+		givenRunInBackground bool
+		shouldHaveIndex      bool
+	}{
+		{
+			testName: "index created correctly, not background",
+			pmpSetupFn: func(t *testing.T, tableName string) *SQLPump {
+				return setupSQLPump(t, tableName, false)
+			},
+			givenTableName:       "analytics_no_background",
+			givenRunInBackground: false,
+			expectedErr:          nil,
+			shouldHaveIndex:      true,
+		},
+		{
+			testName: "index created correctly, background",
+			pmpSetupFn: func(t *testing.T, tableName string) *SQLPump {
+				return setupSQLPump(t, tableName, true)
+			},
+			givenTableName:       "analytics_background",
+			givenRunInBackground: true,
+			expectedErr:          nil,
+			shouldHaveIndex:      true,
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.testName, func(t *testing.T) {
+			pmp := tc.pmpSetupFn(t, tc.givenTableName)
+			defer func() {
+				err := pmp.db.Migrator().DropTable(tc.givenTableName)
+				if err != nil {
+					t.Errorf("Failed to drop table: %v", err)
+				}
+			}()
+			assert.NotNil(t, pmp)
+
+			actualErr := pmp.ensureIndex(tc.givenTableName, tc.givenRunInBackground)
+			isErrExpected := tc.expectedErr != nil
+			didErr := actualErr != nil
+			assert.Equal(t, isErrExpected, didErr)
+
+			if isErrExpected {
+				assert.Equal(t, tc.expectedErr.Error(), actualErr.Error())
+			}
+
+			if actualErr == nil {
+				if tc.givenRunInBackground {
+					// wait for the background index creation to finish
+					<-pmp.backgroundIndexCreated
+				}
+
+				indexToUse := indexes[0]
+				indexName := pmp.buildIndexName(indexToUse.baseName, tc.givenTableName)
+				hasIndex := pmp.db.Table(tc.givenTableName).Migrator().HasIndex(tc.givenTableName, indexName)
+				assert.Equal(t, tc.shouldHaveIndex, hasIndex)
+			}
+		})
+	}
+}
+
+func TestBuildIndexName(t *testing.T) {
+	tests := []struct {
+		indexBaseName string
+		tableName     string
+		expected      string
+	}{
+		{"idx_responsecode", "users", "users_idx_responsecode"},
+		{"idx_apikey", "transactions", "transactions_idx_apikey"},
+		{"idx_timestamp", "logs", "logs_idx_timestamp"},
+		{"idx_apiid", "api_calls", "api_calls_idx_apiid"},
+		{"idx_orgid", "organizations", "organizations_idx_orgid"},
+	}
+
+	c := &SQLPump{} // Create an instance of SQLPump.
+
+	for _, tt := range tests {
+		t.Run(tt.indexBaseName+"_"+tt.tableName, func(t *testing.T) {
+			result := c.buildIndexName(tt.indexBaseName, tt.tableName)
+			if result != tt.expected {
+				t.Errorf("buildIndexName(%s, %s) = %s; want %s", tt.indexBaseName, tt.tableName, result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestSQLWriteUptimeData_SQLite exercises WriteUptimeData against in-memory SQLite, so it runs
+// everywhere - including the coverage CI job, which provisions no PostgreSQL and therefore
+// skips every Postgres-gated test in this package.
+//
+// Init() is deliberately not called: Dialect() has not supported sqlite since v1.12.0, so the
+// pump is built directly over the test database. WriteUptimeData does not migrate in the
+// non-sharded branch, so the table has to exist up front.
+//
+// Note this call mutates the package-level `table` variable declared in influx.go, which is
+// shared process-wide - a pre-existing issue recorded on TT-9424. That is why this test must
+// not be made parallel.
+func TestSQLWriteUptimeData_SQLite(t *testing.T) {
+	db := setupTestDBWithJSONTags(t)
+	require.NoError(t, db.Table(analytics.UptimeSQLTable).AutoMigrate(&analytics.UptimeReportAggregateSQL{}))
+
+	pmp := &SQLPump{IsUptime: true, db: db}
+	pmp.SQLConf = &SQLConf{BatchSize: 100}
+	pmp.log = log.WithField("prefix", SQLPrefix+"-uptime")
+
+	ts := time.Date(2025, 6, 15, 10, 0, 0, 0, time.UTC)
+	records := make([]interface{}, 0, 4)
+	for i := 0; i < 4; i++ {
+		encoded, err := msgpack.Marshal(analytics.UptimeReportData{
+			OrgID:        "org1",
+			URL:          fmt.Sprintf("https://upstream.example/%02d", i),
+			APIID:        "api1",
+			ResponseCode: 200,
+			RequestTime:  10,
+			TimeStamp:    ts,
+		})
+		require.NoError(t, err)
+		records = append(records, string(encoded))
+	}
+
+	checkOrder := assertUpsertedInIDOrder(t, db)
+	pmp.WriteUptimeData(records)
+	checkOrder()
+
+	var recs []analytics.UptimeReportAggregateSQL
+	require.NoError(t, pmp.db.Table(analytics.UptimeSQLTable).Find(&recs).Error)
+
+	// One row per distinct URL plus the implicit "total" row.
+	assert.Len(t, recs, 5)
+	for _, rec := range recs {
+		assert.Equal(t, "org1", rec.OrgID)
+		assert.NotEmpty(t, rec.ID)
+	}
 }

@@ -16,6 +16,7 @@ func init() {
 	AvailablePumps["csv"] = &CSVPump{}
 	AvailablePumps["elasticsearch"] = &ElasticsearchPump{}
 	AvailablePumps["influx"] = &InfluxPump{}
+	AvailablePumps["influx2"] = &Influx2Pump{}
 	AvailablePumps["moesif"] = &MoesifPump{}
 	AvailablePumps["statsd"] = &StatsdPump{}
 	AvailablePumps["segment"] = &SegmentPump{}
@@ -30,4 +31,16 @@ func init() {
 	AvailablePumps["sql"] = &SQLPump{}
 	AvailablePumps["sql_aggregate"] = &SQLAggregatePump{}
 	AvailablePumps["stdout"] = &StdOutPump{}
+	AvailablePumps["timestream"] = &TimestreamPump{}
+	AvailablePumps["mongo-graph"] = &GraphMongoPump{}
+	AvailablePumps["sql-graph"] = &GraphSQLPump{}
+	AvailablePumps["sql-graph-aggregate"] = &GraphSQLAggregatePump{}
+	AvailablePumps["mongo-mcp"] = &MCPMongoPump{}
+	AvailablePumps["mongo-mcp-aggregate"] = &MCPMongoAggregatePump{}
+	AvailablePumps["sql-mcp"] = &MCPSQLPump{}
+	AvailablePumps["sql-mcp-aggregate"] = &MCPSQLAggregatePump{}
+	AvailablePumps["resurfaceio"] = &ResurfacePump{}
+	AvailablePumps["sqs"] = &SQSPump{}
+	AvailablePumps["kinesis"] = &KinesisPump{}
+	AvailablePumps["http"] = &HTTPPump{}
 }

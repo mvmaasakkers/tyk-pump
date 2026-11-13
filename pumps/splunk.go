@@ -3,16 +3,18 @@ package pumps
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 
-	"github.com/mitchellh/mapstructure"
-
 	"github.com/TykTechnologies/tyk-pump/analytics"
+	"github.com/TykTechnologies/tyk-pump/retry"
+	"github.com/sirupsen/logrus"
+
+	"github.com/mitchellh/mapstructure"
 )
 
 const (
@@ -35,8 +37,8 @@ type SplunkClient struct {
 	Token         string
 	CollectorURL  string
 	TLSSkipVerify bool
-
-	httpClient *http.Client
+	httpClient    *http.Client
+	retry         *retry.BackoffHTTPRetry
 }
 
 // SplunkPump is a Tyk Pump driver for Splunk.
@@ -47,20 +49,51 @@ type SplunkPump struct {
 }
 
 // SplunkPumpConfig contains the driver configuration parameters.
+// @PumpConf Splunk
 type SplunkPumpConfig struct {
-	EnvPrefix              string   `mapstructure:"meta_env_prefix"`
-	CollectorToken         string   `mapstructure:"collector_token"`
-	CollectorURL           string   `mapstructure:"collector_url"`
-	SSLInsecureSkipVerify  bool     `mapstructure:"ssl_insecure_skip_verify"`
-	SSLCertFile            string   `mapstructure:"ssl_cert_file"`
-	SSLKeyFile             string   `mapstructure:"ssl_key_file"`
-	SSLServerName          string   `mapstructure:"ssl_server_name"`
-	ObfuscateAPIKeys       bool     `mapstructure:"obfuscate_api_keys"`
-	ObfuscateAPIKeysLength int      `mapstructure:"obfuscate_api_keys_length"`
-	Fields                 []string `mapstructure:"fields"`
-	IgnoreTagPrefixList    []string `mapstructure:"ignore_tag_prefix_list"`
-	EnableBatch            bool     `mapstructure:"enable_batch"`
-	BatchMaxContentLength  int      `mapstructure:"batch_max_content_length"`
+	// The prefix for the environment variables that will be used to override the configuration.
+	// Defaults to `TYK_PMP_PUMPS_SPLUNK_META`
+	EnvPrefix string `mapstructure:"meta_env_prefix"`
+	// Address of the datadog agent including host & port.
+	CollectorToken string `json:"collector_token" mapstructure:"collector_token"`
+	// Endpoint the Pump will send analytics too.  Should look something like:
+	// `https://splunk:8088/services/collector/event`.
+	CollectorURL string `json:"collector_url" mapstructure:"collector_url"`
+	// Controls whether the pump client verifies the Splunk server's certificate chain and host name.
+	SSLInsecureSkipVerify bool `json:"ssl_insecure_skip_verify" mapstructure:"ssl_insecure_skip_verify"`
+	// SSL cert file location.
+	SSLCertFile string `json:"ssl_cert_file" mapstructure:"ssl_cert_file"`
+	// SSL cert key location.
+	SSLKeyFile string `json:"ssl_key_file" mapstructure:"ssl_key_file"`
+	// Path to the PEM file with trusted CA certificates that will be used to verify the Splunk server's certificate.
+	SSLCAFile string `json:"ssl_ca_file" mapstructure:"ssl_ca_file"`
+	// SSL Server name used in the TLS connection.
+	SSLServerName string `json:"ssl_server_name" mapstructure:"ssl_server_name"`
+	// Controls whether the pump client should hide the API key. In case you still need substring
+	// of the value, check the next option. Default value is `false`.
+	ObfuscateAPIKeys bool `json:"obfuscate_api_keys" mapstructure:"obfuscate_api_keys"`
+	// Define the number of the characters from the end of the API key. The `obfuscate_api_keys`
+	// should be set to `true`. Default value is `0`.
+	ObfuscateAPIKeysLength int `json:"obfuscate_api_keys_length" mapstructure:"obfuscate_api_keys_length"`
+	// Define which Analytics fields should participate in the Splunk event. Check the available
+	// fields in the example below. Default value is `["method",
+	// "path", "response_code", "api_key", "time_stamp", "api_version", "api_name", "api_id",
+	// "org_id", "oauth_id", "raw_request", "request_time", "raw_response", "ip_address"]`.
+	Fields []string `json:"fields" mapstructure:"fields"`
+	// Choose which tags to be ignored by the Splunk Pump. Keep in mind that the tag name and value
+	// are hyphenated. Default value is `[]`.
+	IgnoreTagPrefixList []string `json:"ignore_tag_prefix_list" mapstructure:"ignore_tag_prefix_list"`
+	// If this is set to `true`, pump is going to send the analytics records in batch to Splunk.
+	// Default value is `false`.
+	EnableBatch bool `json:"enable_batch" mapstructure:"enable_batch"`
+	// Max content length in bytes to be sent in batch requests. It should match the
+	// `max_content_length` configured in Splunk. If the purged analytics records size don't reach
+	// the amount of bytes, they're send anyways in each `purge_loop`. Default value is 838860800
+	// (~ 800 MB), the same default value as Splunk config.
+	BatchMaxContentLength int `json:"batch_max_content_length" mapstructure:"batch_max_content_length"`
+	// MaxRetries represents the maximum amount of retries to attempt if failed to send requests to splunk HEC.
+	// Default value is `0`
+	MaxRetries uint64 `json:"max_retries" mapstructure:"max_retries"`
 }
 
 // New initializes a new pump.
@@ -91,7 +124,17 @@ func (p *SplunkPump) Init(config interface{}) error {
 
 	p.log.Infof("%s Endpoint: %s", splunkPumpName, p.config.CollectorURL)
 
-	p.client, err = NewSplunkClient(p.config.CollectorToken, p.config.CollectorURL, p.config.SSLInsecureSkipVerify, p.config.SSLCertFile, p.config.SSLKeyFile, p.config.SSLServerName)
+	p.client, err = newSplunkClient(&splunkClientConfig{
+		token:        p.config.CollectorToken,
+		collectorURL: p.config.CollectorURL,
+		tlsConfig: TLSConfig{
+			CertFile:           p.config.SSLCertFile,
+			KeyFile:            p.config.SSLKeyFile,
+			CAFile:             p.config.SSLCAFile,
+			InsecureSkipVerify: p.config.SSLInsecureSkipVerify,
+			ServerName:         p.config.SSLServerName,
+		},
+	}, p.log)
 	if err != nil {
 		return err
 	}
@@ -100,6 +143,11 @@ func (p *SplunkPump) Init(config interface{}) error {
 		p.config.BatchMaxContentLength = maxContentLength
 	}
 
+	if p.config.MaxRetries > 0 {
+		p.log.Infof("%d max retries", p.config.MaxRetries)
+	}
+
+	p.client.retry = retry.NewBackoffRetry("Failed writing data to Splunk", p.config.MaxRetries, p.client.httpClient, p.log)
 	p.log.Info(p.GetName() + " Initialized")
 
 	return nil
@@ -128,15 +176,6 @@ func (p *SplunkPump) WriteData(ctx context.Context, data []interface{}) error {
 	p.log.Debug("Attempting to write ", len(data), " records...")
 
 	var batchBuffer bytes.Buffer
-
-	fnSendBytes := func(data []byte) error {
-		_, errSend := p.client.Send(ctx, data)
-		if errSend != nil {
-			p.log.Error("Error writing data to Splunk ", errSend)
-			return errSend
-		}
-		return nil
-	}
 
 	for _, v := range data {
 		decoded := v.(analytics.AnalyticsRecord)
@@ -229,14 +268,14 @@ func (p *SplunkPump) WriteData(ctx context.Context, data []interface{}) error {
 		if p.config.EnableBatch {
 			//if we're batching and the len of our data is already bigger than max_content_length, we send the data and reset the buffer
 			if batchBuffer.Len()+len(data) > p.config.BatchMaxContentLength {
-				if err := fnSendBytes(batchBuffer.Bytes()); err != nil {
+				if err := p.send(ctx, batchBuffer.Bytes()); err != nil {
 					return err
 				}
 				batchBuffer.Reset()
 			}
 			batchBuffer.Write(data)
 		} else {
-			if err := fnSendBytes(data); err != nil {
+			if err := p.send(ctx, data); err != nil {
 				return err
 			}
 		}
@@ -244,7 +283,7 @@ func (p *SplunkPump) WriteData(ctx context.Context, data []interface{}) error {
 
 	//this if is for data remaining in the buffer when len(buffer) is lower than max_content_length
 	if p.config.EnableBatch && batchBuffer.Len() > 0 {
-		if err := fnSendBytes(batchBuffer.Bytes()); err != nil {
+		if err := p.send(ctx, batchBuffer.Bytes()); err != nil {
 			return err
 		}
 		batchBuffer.Reset()
@@ -255,47 +294,51 @@ func (p *SplunkPump) WriteData(ctx context.Context, data []interface{}) error {
 	return nil
 }
 
-// NewSplunkClient initializes a new SplunkClient.
-func NewSplunkClient(token string, collectorURL string, skipVerify bool, certFile string, keyFile string, serverName string) (c *SplunkClient, err error) {
-	if token == "" || collectorURL == "" {
+type splunkClientConfig struct {
+	token        string
+	collectorURL string
+	tlsConfig    TLSConfig
+}
+
+func newSplunkClient(cfg *splunkClientConfig, log *logrus.Entry) (c *SplunkClient, err error) {
+	if cfg.token == "" || cfg.collectorURL == "" {
 		return c, errInvalidSettings
 	}
-	u, err := url.Parse(collectorURL)
+
+	u, err := url.Parse(cfg.collectorURL)
 	if err != nil {
 		return c, err
 	}
-	tlsConfig := &tls.Config{InsecureSkipVerify: skipVerify}
-	if !skipVerify {
-		if certFile == "" && keyFile == "" {
-			return c, errors.New("ssl_insecure_skip_verify set to false but no ssl_cert_file or ssl_key_file specified")
-		}
-		// Load certificates:
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-		if err != nil {
-			return c, err
-		}
-		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, ServerName: serverName}
+
+	tlsConfig, err := NewTLSConfig(cfg.tlsConfig, log)
+	if err != nil {
+		return c, fmt.Errorf("failed to configure TLS for splunk client: %w", err)
 	}
-	http.DefaultClient.Transport = &http.Transport{TLSClientConfig: tlsConfig}
+
+	http.DefaultClient.Transport = &http.Transport{
+		Proxy:           http.ProxyFromEnvironment,
+		TLSClientConfig: tlsConfig,
+	}
+
 	// Append the default collector API path:
 	u.Path = defaultPath
 	c = &SplunkClient{
-		Token:        token,
+		Token:        cfg.token,
 		CollectorURL: u.String(),
 		httpClient:   http.DefaultClient,
 	}
 	return c, nil
 }
 
-// Send sends an event to the Splunk HTTP Event Collector interface.
-func (c *SplunkClient) Send(ctx context.Context, data []byte) (*http.Response, error) {
-
+func (p *SplunkPump) send(ctx context.Context, data []byte) error {
 	reader := bytes.NewReader(data)
-	req, err := http.NewRequest("POST", c.CollectorURL, reader)
+	req, err := http.NewRequest(http.MethodPost, p.client.CollectorURL, reader)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	req = req.WithContext(ctx)
-	req.Header.Add(authHeaderName, authHeaderPrefix+c.Token)
-	return c.httpClient.Do(req)
+	req.Header.Add(authHeaderName, authHeaderPrefix+p.client.Token)
+
+	p.log.Debugf("Sending %d bytes to splunk", len(data))
+	return p.client.retry.Send(req)
 }

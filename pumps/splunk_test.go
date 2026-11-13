@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -26,13 +27,18 @@ type splunkStatus struct {
 	Len  int    `json:"len"`
 }
 type testHandler struct {
-	test    *testing.T
-	batched bool
-
-	responses []splunkStatus
+	test         *testing.T
+	batched      bool
+	returnErrors int
+	responses    []splunkStatus
+	reqCount     int
 }
 
+var splunkTestLog = log.WithField("prefix", "splunk_test")
+
 func (h *testHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.reqCount++
+
 	authHeaderValue := r.Header.Get("authorization")
 	if authHeaderValue == "" {
 		h.test.Fatal("Auth header is empty")
@@ -44,10 +50,22 @@ func (h *testHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Body == nil {
 		h.test.Fatal("Body is nil")
 	}
-	body, err := ioutil.ReadAll(r.Body)
+
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		h.test.Fatal("Couldn't ready body")
 	}
+	defer r.Body.Close()
+
+	if h.returnErrors >= h.reqCount {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, err := w.Write([]byte("splunk internal error"))
+		if err != nil {
+			h.test.Fatalf("Failed to write response got error %v", err)
+		}
+		return
+	}
+
 	status := splunkStatus{Text: "Success", Code: 0}
 	if !h.batched {
 		event := make(map[string]interface{})
@@ -59,24 +77,338 @@ func (h *testHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		status.Len = len(body)
 	}
 
-	statusJSON, _ := json.Marshal(&status)
+	statusJSON, err := json.Marshal(&status)
+	if err != nil {
+		h.test.Fatalf("Failed to marshal JSON: %v", err)
+	}
 	w.Write(statusJSON)
 	h.responses = append(h.responses, status)
 }
 
 func TestSplunkInit(t *testing.T) {
-	_, err := NewSplunkClient("", testEndpointURL, true, "", "", "")
-	if err == nil {
-		t.Fatal("A token needs to be present")
+	t.Run("missing token", func(t *testing.T) {
+		_, err := newSplunkClient(
+			&splunkClientConfig{collectorURL: testEndpointURL},
+			splunkTestLog,
+		)
+		assert.Error(t, err, "A token needs to be present")
+		assert.Equal(t, errInvalidSettings, err)
+	})
+
+	t.Run("missing collector URL", func(t *testing.T) {
+		_, err := newSplunkClient(
+			&splunkClientConfig{token: testToken},
+			splunkTestLog,
+		)
+		assert.Error(t, err, "An endpoint needs to be present")
+		assert.Equal(t, errInvalidSettings, err)
+	})
+
+	t.Run("empty parameters", func(t *testing.T) {
+		_, err := newSplunkClient(
+			&splunkClientConfig{},
+			splunkTestLog,
+		)
+		assert.Error(t, err, "Empty parameters should return an error")
+		assert.Equal(t, errInvalidSettings, err)
+	})
+
+	t.Run("invalid collector URL format", func(t *testing.T) {
+		_, err := newSplunkClient(
+			&splunkClientConfig{
+				token:        testToken,
+				collectorURL: "://invalid-url",
+			},
+			splunkTestLog,
+		)
+		assert.Error(t, err, "Invalid URL should return an error")
+	})
+
+	t.Run("valid configuration with minimal settings", func(t *testing.T) {
+		client, err := newSplunkClient(
+			&splunkClientConfig{
+				token:        testToken,
+				collectorURL: testEndpointURL,
+			},
+			splunkTestLog,
+		)
+		assert.NoError(t, err)
+		assert.NotNil(t, client)
+		assert.Equal(t, testToken, client.Token)
+		assert.Equal(t, "http://localhost:8088"+defaultPath, client.CollectorURL)
+		assert.NotNil(t, client.httpClient)
+	})
+
+	t.Run("URL path is replaced with default path", func(t *testing.T) {
+		customURL := "http://localhost:8088/some/custom/path"
+		client, err := newSplunkClient(
+			&splunkClientConfig{
+				token:        testToken,
+				collectorURL: customURL,
+			},
+			splunkTestLog,
+		)
+		assert.NoError(t, err)
+		assert.NotNil(t, client)
+		assert.Equal(t, "http://localhost:8088"+defaultPath, client.CollectorURL)
+	})
+
+	t.Run("URL with query parameters", func(t *testing.T) {
+		urlWithQuery := "http://localhost:8088?param=value"
+		client, err := newSplunkClient(
+			&splunkClientConfig{
+				token:        testToken,
+				collectorURL: urlWithQuery,
+			},
+			splunkTestLog,
+		)
+		assert.NoError(t, err)
+		assert.NotNil(t, client)
+		assert.Contains(t, client.CollectorURL, "param=value")
+		assert.Contains(t, client.CollectorURL, defaultPath)
+	})
+
+	t.Run("HTTPS URL scheme", func(t *testing.T) {
+		httpsURL := "https://splunk.example.com:8088"
+		client, err := newSplunkClient(
+			&splunkClientConfig{
+				token:        testToken,
+				collectorURL: httpsURL,
+			},
+			splunkTestLog,
+		)
+		assert.NoError(t, err)
+		assert.NotNil(t, client)
+		assert.Equal(t, httpsURL+defaultPath, client.CollectorURL)
+	})
+
+	t.Run("valid configuration with TLS skip verify", func(t *testing.T) {
+		client, err := newSplunkClient(
+			&splunkClientConfig{
+				token:        testToken,
+				collectorURL: "https://splunk.example.com:8088",
+				tlsConfig: TLSConfig{
+					InsecureSkipVerify: true,
+				},
+			},
+			splunkTestLog,
+		)
+		assert.NoError(t, err)
+		assert.NotNil(t, client)
+		assert.NotNil(t, client.httpClient)
+	})
+
+	t.Run("TLS configuration with invalid cert file", func(t *testing.T) {
+		_, err := newSplunkClient(
+			&splunkClientConfig{
+				token:        testToken,
+				collectorURL: testEndpointURL,
+				tlsConfig: TLSConfig{
+					CertFile: "/nonexistent/cert.pem",
+					KeyFile:  "/nonexistent/key.pem",
+				},
+			},
+			splunkTestLog,
+		)
+		assert.Error(t, err, "Invalid cert file should return an error")
+		assert.Contains(t, err.Error(), "failed to configure TLS")
+	})
+
+	t.Run("TLS configuration with invalid CA file", func(t *testing.T) {
+		_, err := newSplunkClient(
+			&splunkClientConfig{
+				token:        testToken,
+				collectorURL: testEndpointURL,
+				tlsConfig: TLSConfig{
+					CAFile: "/nonexistent/ca.pem",
+				},
+			},
+			splunkTestLog,
+		)
+		assert.Error(t, err, "Invalid CA file should return an error")
+		assert.Contains(t, err.Error(), "failed to configure TLS")
+	})
+}
+
+func Test_SplunkProxyFromEnvironment(t *testing.T) {
+	// Setup a test server to act as a proxy
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "Proxy call successful")
+	}))
+	defer proxyServer.Close()
+
+	// Set environment variable to use the proxy
+	os.Setenv("HTTP_PROXY", proxyServer.URL)
+	defer os.Unsetenv("HTTP_PROXY")
+
+	// Initialize client
+	client, err := newSplunkClient(
+		&splunkClientConfig{
+			token:        "token",
+			collectorURL: "https://example.com",
+			tlsConfig: TLSConfig{
+				InsecureSkipVerify: true,
+			},
+		},
+		splunkTestLog,
+	)
+	if err != nil {
+		t.Fatal("Failed to create client:", err)
 	}
-	_, err = NewSplunkClient(testToken, "", true, "", "", "")
-	if err == nil {
-		t.Fatal("An endpoint needs to be present", "", "")
+
+	// Make a request
+	resp, err := client.httpClient.Get("http://example.com")
+	if err != nil {
+		t.Fatal("Failed to make request:", err)
 	}
-	_, err = NewSplunkClient("", "", true, "", "", "")
-	if err == nil {
-		t.Fatal("Empty parameters should return an error")
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal("Failed to read response:", err)
 	}
+
+	// Check if the proxy was called
+	if string(body) != "Proxy call successful\n" {
+		t.Errorf("Expected proxy to be called, but it wasn't")
+	}
+
+}
+
+func Test_SplunkInvalidProxyURL(t *testing.T) {
+	// Set an invalid proxy URL
+	os.Setenv("HTTP_PROXY", "htttp://invalid-url")
+	defer os.Unsetenv("HTTP_PROXY")
+
+	// Initialize client
+	client, err := newSplunkClient(
+		&splunkClientConfig{
+			token:        "token",
+			collectorURL: "https://example.com",
+			tlsConfig: TLSConfig{
+				InsecureSkipVerify: true,
+			},
+		},
+		splunkTestLog,
+	)
+	if err != nil {
+		t.Fatal("Failed to create client:", err)
+	}
+
+	// Make a request and expect it to fail
+	_, err = client.httpClient.Get("http://example.com")
+	if err == nil {
+		t.Error("Expected error due to invalid proxy URL, but no error occurred")
+	}
+}
+
+func Test_SplunkBackoffRetry(t *testing.T) {
+	go t.Run("max_retries=1", func(t *testing.T) {
+		handler := &testHandler{test: t, batched: false, returnErrors: 1}
+		server := httptest.NewUnstartedServer(handler)
+		server.Config.SetKeepAlivesEnabled(false)
+		server.Start()
+
+		defer server.Close()
+
+		pmp := SplunkPump{}
+		cfg := make(map[string]interface{})
+		cfg["collector_token"] = testToken
+		cfg["max_retries"] = 1
+		cfg["collector_url"] = server.URL
+		cfg["ssl_insecure_skip_verify"] = true
+
+		if err := pmp.Init(cfg); err != nil {
+			t.Errorf("Error initializing pump %v", err)
+			return
+		}
+
+		keys := make([]interface{}, 1)
+
+		keys[0] = analytics.AnalyticsRecord{OrgID: "1", APIID: "123", Path: "/test-path", Method: "POST", TimeStamp: time.Now()}
+
+		if errWrite := pmp.WriteData(context.TODO(), keys); errWrite != nil {
+			t.Error("Error writing to splunk pump:", errWrite.Error())
+			return
+		}
+
+		assert.Equal(t, 1, len(handler.responses))
+		assert.Equal(t, 2, handler.reqCount)
+
+		response := handler.responses[0]
+
+		assert.Equal(t, "Success", response.Text)
+		assert.Equal(t, int32(0), response.Code)
+	})
+
+	t.Run("max_retries=0", func(t *testing.T) {
+		handler := &testHandler{test: t, batched: false, returnErrors: 1}
+		server := httptest.NewUnstartedServer(handler)
+		server.Config.SetKeepAlivesEnabled(false)
+		server.Start()
+
+		defer server.Close()
+
+		pmp := SplunkPump{}
+		cfg := make(map[string]interface{})
+		cfg["collector_token"] = testToken
+		cfg["max_retries"] = 0
+		cfg["collector_url"] = server.URL
+		cfg["ssl_insecure_skip_verify"] = true
+
+		if err := pmp.Init(cfg); err != nil {
+			t.Errorf("Error initializing pump %v", err)
+			return
+		}
+
+		keys := make([]interface{}, 1)
+
+		keys[0] = analytics.AnalyticsRecord{OrgID: "1", APIID: "123", Path: "/test-path", Method: "POST", TimeStamp: time.Now()}
+
+		if errWrite := pmp.WriteData(context.TODO(), keys); errWrite == nil {
+			t.Error("Error expected writing to splunk pump, got nil")
+			return
+		}
+
+		assert.Equal(t, 1, handler.reqCount)
+	})
+
+	t.Run("max_retries=3", func(t *testing.T) {
+		handler := &testHandler{test: t, batched: false, returnErrors: 2}
+		server := httptest.NewUnstartedServer(handler)
+		server.Config.SetKeepAlivesEnabled(false)
+		server.Start()
+
+		defer server.Close()
+
+		pmp := SplunkPump{}
+		cfg := make(map[string]interface{})
+		cfg["collector_token"] = testToken
+		cfg["max_retries"] = 3
+		cfg["collector_url"] = server.URL
+		cfg["ssl_insecure_skip_verify"] = true
+
+		if err := pmp.Init(cfg); err != nil {
+			t.Errorf("Error initializing pump %v", err)
+			return
+		}
+
+		keys := make([]interface{}, 1)
+
+		keys[0] = analytics.AnalyticsRecord{OrgID: "1", APIID: "123", Path: "/test-path", Method: "POST", TimeStamp: time.Now()}
+
+		if errWrite := pmp.WriteData(context.TODO(), keys); errWrite != nil {
+			t.Error("Error writing to splunk pump:", errWrite.Error())
+			return
+		}
+
+		assert.Equal(t, 1, len(handler.responses))
+		assert.Equal(t, 3, handler.reqCount)
+
+		response := handler.responses[0]
+
+		assert.Equal(t, "Success", response.Text)
+		assert.Equal(t, int32(0), response.Code)
+	})
 }
 
 func Test_SplunkWriteData(t *testing.T) {
@@ -112,6 +444,7 @@ func Test_SplunkWriteData(t *testing.T) {
 	assert.Equal(t, "Success", response.Text)
 	assert.Equal(t, int32(0), response.Code)
 }
+
 func Test_SplunkWriteDataBatch(t *testing.T) {
 	handler := &testHandler{test: t, batched: true}
 	server := httptest.NewServer(handler)
@@ -123,8 +456,6 @@ func Test_SplunkWriteDataBatch(t *testing.T) {
 	keys[1] = analytics.AnalyticsRecord{OrgID: "1", APIID: "123", Path: "/test-path", Method: "POST", TimeStamp: time.Now()}
 	keys[2] = analytics.AnalyticsRecord{OrgID: "1", APIID: "123", Path: "/test-path", Method: "POST", TimeStamp: time.Now()}
 
-	fmt.Println(maxContentLength)
-
 	pmp := SplunkPump{}
 
 	cfg := make(map[string]interface{})
@@ -132,7 +463,7 @@ func Test_SplunkWriteDataBatch(t *testing.T) {
 	cfg["collector_url"] = server.URL
 	cfg["ssl_insecure_skip_verify"] = true
 	cfg["enable_batch"] = true
-	cfg["batch_max_content_length"] = getEventBytes(keys[:2])
+	cfg["batch_max_content_length"] = getEventBytes(keys[:2], t)
 
 	if errInit := pmp.Init(cfg); errInit != nil {
 		t.Error("Error initializing pump")
@@ -146,13 +477,12 @@ func Test_SplunkWriteDataBatch(t *testing.T) {
 
 	assert.Equal(t, 2, len(handler.responses))
 
-	assert.Equal(t, getEventBytes(keys[:2]), handler.responses[0].Len)
-	assert.Equal(t, getEventBytes(keys[2:]), handler.responses[1].Len)
-
+	assert.Equal(t, getEventBytes(keys[:2], t), handler.responses[0].Len)
+	assert.Equal(t, getEventBytes(keys[2:], t), handler.responses[1].Len)
 }
 
-//getEventBytes returns the bytes amount of the marshalled events struct
-func getEventBytes(records []interface{}) int {
+// getEventBytes returns the bytes amount of the marshalled events struct
+func getEventBytes(records []interface{}, t *testing.T) int {
 	result := 0
 
 	for _, record := range records {
@@ -180,7 +510,10 @@ func getEventBytes(records []interface{}) int {
 			Event map[string]interface{} `json:"event"`
 		}{Time: decoded.TimeStamp.Unix(), Event: event}
 
-		data, _ := json.Marshal(eventWrap)
+		data, err := json.Marshal(eventWrap)
+		if err != nil {
+			t.Fatal("Failed to marshal event:", err) // Adjusted for context that t is not available, consider passing testing.T or handle differently.
+		}
 		result += len(data)
 	}
 	return result

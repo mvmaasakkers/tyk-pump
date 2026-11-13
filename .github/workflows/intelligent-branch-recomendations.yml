@@ -1,0 +1,19 @@
+name: PR Merge Suggestions
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  branch-suggestions:
+    uses: TykTechnologies/github-actions/.github/workflows/branch-suggestion.yml@c0d4c3d3b5db876ba40f03be6d87074ad53c1aea # main
+    secrets:
+      JIRA_READ_AUTH: ${{ secrets.JIRA_READ_AUTH }}
+      JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}

@@ -1,0 +1,28 @@
+name: Validate PR against Jira
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: jira-validator-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write       # Assume the ECR role that pulls the linter image
+      pull-requests: write  # Post and delete the sticky comment
+      contents: read
+    steps:
+      - name: Validate Jira ticket
+        uses: TykTechnologies/github-actions/jira-linter@production
+        with:
+          jira-base-url: ${{ secrets.JIRA_BASE_URL }}
+          jira-read-auth: ${{ secrets.JIRA_READ_AUTH }}

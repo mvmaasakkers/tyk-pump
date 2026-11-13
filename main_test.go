@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"fmt"
-
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/signal"
 	"sync"
@@ -11,8 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/TykTechnologies/storage/kv/resolver"
 	"github.com/TykTechnologies/tyk-pump/analytics"
 	"github.com/TykTechnologies/tyk-pump/pumps"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -29,9 +33,11 @@ func (p *MockedPump) GetName() string {
 func (p *MockedPump) New() pumps.Pump {
 	return &MockedPump{}
 }
+
 func (p *MockedPump) Init(config interface{}) error {
 	return nil
 }
+
 func (p *MockedPump) WriteData(ctx context.Context, keys []interface{}) error {
 	for range keys {
 		p.CounterRequest++
@@ -45,7 +51,6 @@ func (p *MockedPump) Shutdown() error {
 }
 
 func TestFilterData(t *testing.T) {
-
 	mockedPump := &MockedPump{}
 
 	mockedPump.SetFilters(
@@ -63,54 +68,70 @@ func TestFilterData(t *testing.T) {
 	if len(keys) == len(filteredKeys) {
 		t.Fatal("keys and filtered keys have the  same lenght")
 	}
-
 }
 
 // TestTrimData check the correct functionality of max_record_size
 func TestTrimData(t *testing.T) {
-	mockedPump := &MockedPump{}
-
 	loremIpsum := "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua"
 
-	// key = max_record_size, val = expected output
-	testMatrix := map[int]int{
-		0:                   len(loremIpsum), // if not set then we should not trim
-		5:                   5,               // 5 should be the length of raw response and raw request
-		len(loremIpsum) + 1: len(loremIpsum), // if the raw data is smaller than max_record_size, then nothing is trimmed
+	tcs := []struct {
+		testName       string
+		maxRecordsSize int
+		expectedOutput int
+	}{
+		{
+			testName:       "not set",
+			maxRecordsSize: 0,
+			expectedOutput: len(loremIpsum),
+		},
+		{
+			testName:       "set smaller",
+			maxRecordsSize: 5,
+			expectedOutput: 5,
+		},
+		{
+			testName:       "set bigger",
+			maxRecordsSize: len(loremIpsum) + 1,
+			expectedOutput: len(loremIpsum),
+		},
 	}
 
-	keys := make([]interface{}, 1)
-	//test for global config max_record_size
-	for maxRecordSize, expected := range testMatrix {
-		SystemConfig.MaxRecordSize = maxRecordSize
+	for _, tc := range tcs {
+		t.Run(tc.testName, func(t *testing.T) {
+			mockedPump := &MockedPump{}
+			keys := make([]interface{}, 1)
+			keys[0] = analytics.AnalyticsRecord{
+				APIID:       "api1",
+				RawResponse: loremIpsum,
+				RawRequest:  loremIpsum,
+			}
 
-		keys[0] = analytics.AnalyticsRecord{
-			APIID:       "api1",
-			RawResponse: loremIpsum,
-			RawRequest:  loremIpsum,
-		}
+			t.Run("global config", func(t *testing.T) {
+				// first we test with global config
+				SystemConfig.MaxRecordSize = tc.maxRecordsSize
+				defer func() {
+					SystemConfig.MaxRecordSize = 0
+				}()
 
-		filteredKeys := filterData(mockedPump, keys)
-		decoded := filteredKeys[0].(analytics.AnalyticsRecord)
+				filteredKeys := filterData(mockedPump, keys)
+				decoded, ok := filteredKeys[0].(analytics.AnalyticsRecord)
+				assert.True(t, ok)
 
-		assert.Equal(t, len(decoded.RawRequest), expected)
-		assert.Equal(t, len(decoded.RawResponse), expected)
-	}
-	//test for individual pump config with max_record_size
-	for maxRecordSize, expected := range testMatrix {
-		mockedPump.SetMaxRecordSize(maxRecordSize)
+				assert.Equal(t, len(decoded.RawRequest), tc.expectedOutput)
+				assert.Equal(t, len(decoded.RawResponse), tc.expectedOutput)
+			})
+			t.Run("pump config", func(t *testing.T) {
+				// we try setting pump directly
+				mockedPump.SetMaxRecordSize(tc.maxRecordsSize)
 
-		keys[0] = analytics.AnalyticsRecord{
-			APIID:       "api1",
-			RawResponse: loremIpsum,
-			RawRequest:  loremIpsum,
-		}
+				filteredKeys := filterData(mockedPump, keys)
+				decoded, ok := filteredKeys[0].(analytics.AnalyticsRecord)
+				assert.True(t, ok)
 
-		filteredKeys := filterData(mockedPump, keys)
-		decoded := filteredKeys[0].(analytics.AnalyticsRecord)
-
-		assert.Equal(t, len(decoded.RawRequest), expected)
-		assert.Equal(t, len(decoded.RawResponse), expected)
+				assert.Equal(t, len(decoded.RawRequest), tc.expectedOutput)
+				assert.Equal(t, len(decoded.RawResponse), tc.expectedOutput)
+			})
+		})
 	}
 }
 
@@ -131,51 +152,134 @@ func TestOmitDetailsFilterData(t *testing.T) {
 	}
 }
 
-func TestWriteData(t *testing.T) {
-	mockedPump := &MockedPump{}
-	Pumps = []pumps.Pump{mockedPump}
-
-	keys := make([]interface{}, 3)
-	keys[0] = analytics.AnalyticsRecord{APIID: "api111"}
-	keys[1] = analytics.AnalyticsRecord{APIID: "api123"}
-	keys[2] = analytics.AnalyticsRecord{APIID: "api321"}
-
-	job := instrument.NewJob("TestJob")
-
-	writeToPumps(keys, job, time.Now(), 2)
-
-	mockedPump = Pumps[0].(*MockedPump)
-
-	if mockedPump.CounterRequest != 3 {
-		t.Fatal("MockedPump should have 3 requests")
-	}
-
-}
-
 func TestWriteDataWithFilters(t *testing.T) {
 	mockedPump := &MockedPump{}
 	mockedPump.SetFilters(
 		analytics.AnalyticsFilters{
-			APIIDs: []string{"api123"},
+			SkippedResponseCodes: []int{200},
+		},
+	)
+	mockedPump2 := &MockedPump{}
+	mockedPump3 := &MockedPump{}
+	mockedPump3.SetFilters(
+		analytics.AnalyticsFilters{
+			ResponseCodes: []int{200},
+		},
+	)
+	mockedPump4 := &MockedPump{}
+	mockedPump4.SetFilters(
+		analytics.AnalyticsFilters{
+			APIIDs:        []string{"api123"},
+			OrgsIDs:       []string{"123"},
+			ResponseCodes: []int{200},
+		},
+	)
+	mockedPump5 := &MockedPump{}
+	mockedPump5.SetFilters(
+		analytics.AnalyticsFilters{
+			APIIDs:        []string{"api111"},
+			OrgsIDs:       []string{"123"},
+			ResponseCodes: []int{200},
 		},
 	)
 
-	Pumps = []pumps.Pump{mockedPump}
+	Pumps = []pumps.Pump{mockedPump, mockedPump2, mockedPump3, mockedPump4, mockedPump5}
+	assert.Len(t, Pumps, 5)
 
-	keys := make([]interface{}, 3)
-	keys[0] = analytics.AnalyticsRecord{APIID: "api111"}
-	keys[1] = analytics.AnalyticsRecord{APIID: "api123"}
-	keys[2] = analytics.AnalyticsRecord{APIID: "api321"}
+	keys := make([]interface{}, 6)
+	keys[0] = analytics.AnalyticsRecord{APIID: "api111", ResponseCode: 400, OrgID: "321"}
+	keys[1] = analytics.AnalyticsRecord{APIID: "api123", ResponseCode: 200, OrgID: "123"}
+	keys[2] = analytics.AnalyticsRecord{APIID: "api123", ResponseCode: 500, OrgID: "123"}
+	keys[3] = analytics.AnalyticsRecord{APIID: "api123", ResponseCode: 200, OrgID: "321"}
+	keys[4] = analytics.AnalyticsRecord{APIID: "api111", ResponseCode: 404, OrgID: "321"}
+	keys[5] = analytics.AnalyticsRecord{APIID: "api111", ResponseCode: 500, OrgID: "321"}
 
 	job := instrument.NewJob("TestJob")
-
 	writeToPumps(keys, job, time.Now(), 2)
 
-	mockedPump = Pumps[0].(*MockedPump)
+	tcs := []struct {
+		testName               string
+		mockedPump             *MockedPump
+		expectedCounterRequest int
+	}{
+		{
+			testName:               "skip_response_code 200",
+			mockedPump:             Pumps[0].(*MockedPump),
+			expectedCounterRequest: 4,
+		},
+		{
+			testName:               "no filter - all records",
+			mockedPump:             Pumps[1].(*MockedPump),
+			expectedCounterRequest: 6,
+		},
+		{
+			testName:               "response_codes 200",
+			mockedPump:             Pumps[2].(*MockedPump),
+			expectedCounterRequest: 2,
+		},
+		{
+			testName:               "api_ids api123 + org_ids 123 + responseCode 200 filters",
+			mockedPump:             Pumps[3].(*MockedPump),
+			expectedCounterRequest: 1,
+		},
+		{
+			testName:               "api_ids api111 + org_ids 123 + responseCode 200 filters",
+			mockedPump:             Pumps[4].(*MockedPump),
+			expectedCounterRequest: 0,
+		},
+	}
 
-	if mockedPump.CounterRequest != 1 {
-		fmt.Println(mockedPump.CounterRequest)
-		t.Fatal("MockedPump with filter should have 3 requests")
+	for _, tc := range tcs {
+		tc := tc
+		t.Run(tc.testName, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.expectedCounterRequest, tc.mockedPump.CounterRequest)
+			assert.Len(t, keys, 6)
+		})
+	}
+}
+
+func TestWriteDataWithFilters_HTTPPump(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		received []analytics.AnalyticsRecord
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var records []analytics.AnalyticsRecord
+		if err := json.NewDecoder(r.Body).Decode(&records); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		received = append(received, records...)
+		mu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	httpPump := &pumps.HTTPPump{}
+	assert.NoError(t, httpPump.Init(map[string]interface{}{"url": srv.URL, "mcp_only": true}))
+	httpPump.SetFilters(analytics.AnalyticsFilters{APIIDs: []string{"api123"}})
+	httpPump.SetOmitDetailedRecording(true)
+
+	Pumps = []pumps.Pump{httpPump}
+	defer func() { Pumps = nil }()
+
+	mcp := analytics.MCPStats{IsMCP: true, JSONRPCMethod: "tools/call", PrimitiveType: "tool", PrimitiveName: "t1"}
+	keys := []interface{}{
+		analytics.AnalyticsRecord{APIID: "api123", ResponseCode: 200, RawRequest: "cmF3", MCPStats: mcp},
+		analytics.AnalyticsRecord{APIID: "api111", ResponseCode: 200, MCPStats: mcp},
+		analytics.AnalyticsRecord{APIID: "api123", ResponseCode: 200},
+	}
+
+	writeToPumps(keys, instrument.NewJob("TestJob"), time.Now(), 2)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if assert.Len(t, received, 1) {
+		assert.Equal(t, "api123", received[0].APIID)
+		assert.True(t, received[0].MCPStats.IsMCP)
+		assert.Empty(t, received[0].RawRequest, "omit_detailed_recording must apply")
 	}
 }
 
@@ -215,4 +319,324 @@ func TestShutdown(t *testing.T) {
 	if mockedPump.TurnedOff != true {
 		t.Fatal("MockedPump should have turned off")
 	}
+}
+
+func TestIgnoreFieldsFilterData(t *testing.T) {
+	keys := make([]interface{}, 1)
+	record := analytics.AnalyticsRecord{APIID: "api111", RawResponse: "test", RawRequest: "test", OrgID: "321", ResponseCode: 200, RequestTime: 123}
+	keys[0] = record
+
+	recordWithoutAPIID := record
+	recordWithoutAPIID.APIID = ""
+
+	recordWithoutAPIIDAndAPIName := record
+	recordWithoutAPIIDAndAPIName.APIID = ""
+
+	tcs := []struct {
+		expectedRecord analytics.AnalyticsRecord
+		testName       string
+		ignoreFields   []string
+	}{
+		{
+			testName:       "ignore 1 field",
+			ignoreFields:   []string{"api_id"},
+			expectedRecord: recordWithoutAPIID,
+		},
+		{
+			testName:       "ignore 2 fields",
+			ignoreFields:   []string{"api_id", "api_name"},
+			expectedRecord: recordWithoutAPIIDAndAPIName,
+		},
+		{
+			testName:       "invalid field - log error must be shown",
+			ignoreFields:   []string{"api_id", "api_name", "invalid_field"},
+			expectedRecord: recordWithoutAPIIDAndAPIName,
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.testName, func(t *testing.T) {
+			mockedPump := &MockedPump{}
+			mockedPump.SetIgnoreFields(tc.ignoreFields)
+
+			filteredKeys := filterData(mockedPump, keys)
+
+			for _, key := range filteredKeys {
+				record, ok := key.(analytics.AnalyticsRecord)
+				assert.True(t, ok)
+				assert.Equal(t, tc.expectedRecord, record)
+			}
+		})
+	}
+}
+
+func TestDecodedKey(t *testing.T) {
+	keys := make([]interface{}, 1)
+	record := analytics.AnalyticsRecord{APIID: "api111", RawResponse: "RGVjb2RlZFJlc3BvbnNl", RawRequest: "RGVjb2RlZFJlcXVlc3Q="}
+	keys[0] = record
+
+	tcs := []struct {
+		expectedRawResponse string
+		expectedRawRequest  string
+		testName            string
+		decodeResponse      bool
+		decodeRequest       bool
+	}{
+		{
+			testName:            "Decode RESPONSE & REQUEST",
+			expectedRawResponse: "DecodedResponse",
+			expectedRawRequest:  "DecodedRequest",
+			decodeResponse:      true,
+			decodeRequest:       true,
+		},
+		{
+			testName:            "Decode RESPONSE",
+			expectedRawResponse: "DecodedResponse",
+			expectedRawRequest:  "RGVjb2RlZFJlcXVlc3Q=",
+			decodeResponse:      true,
+			decodeRequest:       false,
+		},
+		{
+			testName:            "Decode REQUEST",
+			expectedRawResponse: "RGVjb2RlZFJlc3BvbnNl",
+			expectedRawRequest:  "DecodedRequest",
+			decodeResponse:      false,
+			decodeRequest:       true,
+		},
+		{
+			testName:            "Decode NONE",
+			expectedRawResponse: "RGVjb2RlZFJlc3BvbnNl",
+			expectedRawRequest:  "RGVjb2RlZFJlcXVlc3Q=",
+			decodeResponse:      false,
+			decodeRequest:       false,
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.testName, func(t *testing.T) {
+			mockedPump := &MockedPump{}
+			mockedPump.SetDecodingRequest(tc.decodeRequest)
+			mockedPump.SetDecodingResponse(tc.decodeResponse)
+			filteredKeys := filterData(mockedPump, keys)
+			assert.Len(t, filteredKeys, 1)
+			record1, ok := filteredKeys[0].(analytics.AnalyticsRecord)
+			assert.True(t, ok)
+			assert.Equal(t, tc.expectedRawResponse, record1.RawResponse)
+			assert.Equal(t, tc.expectedRawRequest, record1.RawRequest)
+		})
+	}
+}
+
+func TestDeprecationWarnings(t *testing.T) {
+	originalOutput := log.Out
+	originalLevel := log.Level
+	t.Cleanup(func() {
+		log.Out = originalOutput
+		log.Level = originalLevel
+	})
+
+	decodeRequestMsg := "Global raw_request_decoded setting is deprecated. Please use pump level raw_request_decoded configuration instead."
+	decodeResponseMsg := "Global raw_response_decoded setting is deprecated. Please use pump level raw_response_decoded configuration instead."
+
+	tcs := []struct {
+		testName              string
+		expectedRequestMsg    string
+		expectedResponseMsg   string
+		decodeRawRequest      bool
+		decodeRawResponse     bool
+		shouldLogRequestWarn  bool
+		shouldLogResponseWarn bool
+	}{
+		{
+			testName:              "both deprecated settings enabled",
+			decodeRawRequest:      true,
+			decodeRawResponse:     true,
+			expectedRequestMsg:    decodeRequestMsg,
+			expectedResponseMsg:   decodeResponseMsg,
+			shouldLogRequestWarn:  true,
+			shouldLogResponseWarn: true,
+		},
+		{
+			testName:              "only raw_request_decoded enabled",
+			decodeRawRequest:      true,
+			decodeRawResponse:     false,
+			expectedRequestMsg:    decodeRequestMsg,
+			expectedResponseMsg:   "",
+			shouldLogRequestWarn:  true,
+			shouldLogResponseWarn: false,
+		},
+		{
+			testName:              "only raw_response_decoded enabled",
+			decodeRawRequest:      false,
+			decodeRawResponse:     true,
+			expectedRequestMsg:    "",
+			expectedResponseMsg:   decodeResponseMsg,
+			shouldLogRequestWarn:  false,
+			shouldLogResponseWarn: true,
+		},
+		{
+			testName:              "both deprecated settings disabled",
+			decodeRawRequest:      false,
+			decodeRawResponse:     false,
+			expectedRequestMsg:    "",
+			expectedResponseMsg:   "",
+			shouldLogRequestWarn:  false,
+			shouldLogResponseWarn: false,
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.testName, func(t *testing.T) {
+			var buf bytes.Buffer
+			log.Out = &buf
+			log.Level = logrus.WarnLevel
+
+			originalSystemConfig := SystemConfig
+			t.Cleanup(func() {
+				SystemConfig = originalSystemConfig
+			})
+
+			SystemConfig = TykPumpConfiguration{
+				DecodeRawRequest:  tc.decodeRawRequest,
+				DecodeRawResponse: tc.decodeRawResponse,
+			}
+
+			showDecodeDeprecationWarnings()
+
+			logOutput := buf.String()
+
+			if tc.shouldLogRequestWarn {
+				assert.Contains(t, logOutput, tc.expectedRequestMsg, "Expected raw_request deprecation warning not found")
+			} else {
+				assert.NotContains(t, logOutput, "raw_request_decoded setting is deprecated", "Unexpected raw_request deprecation warning found")
+			}
+
+			if tc.shouldLogResponseWarn {
+				assert.Contains(t, logOutput, tc.expectedResponseMsg, "Expected raw_response deprecation warning not found")
+			} else {
+				assert.NotContains(t, logOutput, "raw_response_decoded setting is deprecated", "Unexpected raw_response deprecation warning found")
+			}
+
+			if tc.shouldLogRequestWarn || tc.shouldLogResponseWarn {
+				assert.Contains(t, logOutput, "prefix=main", "Expected log prefix not found")
+			}
+		})
+	}
+}
+
+type initRecord struct {
+	resolverAtInit resolver.Resolver
+	called         bool
+}
+
+type recordingPump struct {
+	rec *initRecord
+	pumps.CommonPumpConfig
+}
+
+func (p *recordingPump) New() pumps.Pump { return &recordingPump{rec: p.rec} }
+
+func (p *recordingPump) GetName() string { return "Recording Pump" }
+
+func (p *recordingPump) Init(interface{}) error {
+	p.rec.called = true
+	p.rec.resolverAtInit = pumps.GetKVResolver()
+	return nil
+}
+
+func (p *recordingPump) WriteData(context.Context, []interface{}) error { return nil }
+
+type spyResolver struct{}
+
+func (s *spyResolver) Resolve(_ context.Context, input string) (string, error) { return input, nil }
+
+func (s *spyResolver) ResolveAll(_ context.Context, rawJSON []byte) ([]byte, error) {
+	return rawJSON, nil
+}
+
+func registerRecordingPump(t *testing.T, pumpType string) *initRecord {
+	t.Helper()
+
+	rec := &initRecord{}
+	pumps.AvailablePumps[pumpType] = &recordingPump{rec: rec}
+
+	origPumps := Pumps
+	origConfig := SystemConfig
+	t.Cleanup(func() {
+		delete(pumps.AvailablePumps, pumpType)
+		Pumps = origPumps
+		SystemConfig = origConfig
+		pumps.SetKVResolver(nil)
+	})
+
+	return rec
+}
+
+func TestInitialisePumps_BuildsConfiguredPumps(t *testing.T) {
+	registerRecordingPump(t, "recording")
+
+	SystemConfig = TykPumpConfiguration{
+		DontPurgeUptimeData: true,
+		Pumps: map[string]PumpConfig{
+			"first":  {Type: "recording"},
+			"second": {Type: "recording"},
+		},
+	}
+
+	initialisePumps(nil)
+
+	assert.Len(t, Pumps, 2, "every configured pump must be initialised")
+}
+
+func TestInitialisePumps_SkipsUnknownPumpType(t *testing.T) {
+	registerRecordingPump(t, "recording")
+
+	SystemConfig = TykPumpConfiguration{
+		DontPurgeUptimeData: true,
+		Pumps: map[string]PumpConfig{
+			"known":   {Type: "recording"},
+			"unknown": {Type: "does-not-exist"},
+		},
+	}
+
+	initialisePumps(nil)
+
+	assert.Len(t, Pumps, 1, "an unknown pump type must be skipped, not fatal")
+}
+
+func TestInitialisePumps_InstallsResolverDuringInitAndClearsAfter(t *testing.T) {
+	rec := registerRecordingPump(t, "recording")
+
+	spy := &spyResolver{}
+	stores := &kvStores{resolver: spy}
+
+	SystemConfig = TykPumpConfiguration{
+		DontPurgeUptimeData: true,
+		Pumps: map[string]PumpConfig{
+			"only": {Type: "recording"},
+		},
+	}
+
+	initialisePumps(stores)
+
+	assert.True(t, rec.called, "the pump must have initialised")
+	assert.Same(t, spy, rec.resolverAtInit, "the resolver from kvStores must be installed while pumps initialise")
+	assert.Nil(t, pumps.GetKVResolver(), "the resolver must be cleared once every pump is up")
+}
+
+func TestInitialisePumps_NilKVStoresInstallsNoResolver(t *testing.T) {
+	rec := registerRecordingPump(t, "recording")
+
+	SystemConfig = TykPumpConfiguration{
+		DontPurgeUptimeData: true,
+		Pumps: map[string]PumpConfig{
+			"only": {Type: "recording"},
+		},
+	}
+
+	assert.NotPanics(t, func() { initialisePumps(nil) }, "a nil kvStores must be safe")
+
+	assert.True(t, rec.called, "the pump must have initialised")
+	assert.Nil(t, rec.resolverAtInit, "a nil kvStores installs no resolver")
+	assert.Len(t, Pumps, 1)
 }

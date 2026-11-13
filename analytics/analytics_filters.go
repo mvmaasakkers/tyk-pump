@@ -1,12 +1,18 @@
 package analytics
 
 type AnalyticsFilters struct {
-	OrgsIDs              []string `json:"org_ids"`
-	APIIDs               []string `json:"api_ids"`
-	ResponseCodes        []int    `json:"response_codes"`
-	SkippedOrgsIDs       []string `json:"skip_org_ids"`
-	SkippedAPIIDs        []string `json:"skip_api_ids"`
-	SkippedResponseCodes []int    `json:"skip_response_codes"`
+	// Filters pump data by an allow list of org_ids.
+	OrgsIDs []string `json:"org_ids"`
+	// Filters pump data by an allow list of api_ids.
+	APIIDs []string `json:"api_ids"`
+	// Filters pump data by an allow list of response_codes.
+	ResponseCodes []int `json:"response_codes"`
+	// Filters pump data by a block list of org_ids.
+	SkippedOrgsIDs []string `json:"skip_org_ids"`
+	// Filters pump data by a block list of api_ids.
+	SkippedAPIIDs []string `json:"skip_api_ids"`
+	// Filters pump data by a block list of response_codes.
+	SkippedResponseCodes []int `json:"skip_response_codes"`
 }
 
 func (filters AnalyticsFilters) ShouldFilter(record AnalyticsRecord) bool {

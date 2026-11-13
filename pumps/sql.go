@@ -1,38 +1,66 @@
 package pumps
 
 import (
+	"cmp"
 	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/TykTechnologies/tyk-pump/analytics"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/mitchellh/mapstructure"
 	"gopkg.in/vmihailenco/msgpack.v2"
 	"gorm.io/gorm/clause"
 
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
-	gorm_logger "gorm.io/gorm/logger"
 )
 
 type PostgresConfig struct {
-	// disables implicit prepared statement usage
+	// Disables implicit prepared statement usage.
 	PreferSimpleProtocol bool `json:"prefer_simple_protocol" mapstructure:"prefer_simple_protocol"`
+	// Maximum number of open connections to the database per connection pool.
+	// `0` (default) means unlimited.
+	//
+	// Tyk Pump maintains one connection pool for each configured pump,
+	// so if both `sql` and `sql_aggregate` pumps are configured
+	// there will be two connection pools each limited to `max_open_connections` connections.
+	// Negative values are rejected.
+	MaxOpenConnections int `json:"max_open_connections" mapstructure:"max_open_connections"`
+	// Maximum number of idle connections that will be kept in each connection pool.
+	// Tyk Pump maintains one connection pool for each configured pump.
+	// `0` (default) uses the Go default which is currently 2.
+	// Negative values are rejected.
+	MaxIdleConnections int `json:"max_idle_connections" mapstructure:"max_idle_connections"`
+	// Maximum length of time that a connection may be reused, as a Go duration string
+	// (e.g. `30m`). Empty (default) means connections are reused forever.
+	ConnectionMaxLifetime string `json:"connection_max_lifetime" mapstructure:"connection_max_lifetime"`
+	// Maximum length of time a connection may sit idle before being closed, as a Go
+	// duration string (e.g. `5m`). Empty (default) means idle connections are never
+	// closed for being idle.
+	ConnectionMaxIdleTime string `json:"connection_max_idle_time" mapstructure:"connection_max_idle_time"`
 }
 
 type MysqlConfig struct {
-	// default size for string fields. By default set to: 256
+	// Default size for string fields. Defaults to `256`.
 	DefaultStringSize uint `json:"default_string_size" mapstructure:"default_string_size"`
-	// disable datetime precision, which not supported before MySQL 5.6
+	// Disable datetime precision, which not supported before MySQL 5.6.
 	DisableDatetimePrecision bool `json:"disable_datetime_precision" mapstructure:"disable_datetime_precision"`
-	// drop & create when rename index, rename index not supported before MySQL 5.7, MariaDB
+	// Drop & create when rename index, rename index not supported before MySQL 5.7, MariaDB.
 	DontSupportRenameIndex bool `json:"dont_support_rename_index" mapstructure:"dont_support_rename_index"`
-	// `change` when rename column, rename column not supported before MySQL 8, MariaDB
+	// `change` when rename column, rename column not supported before MySQL 8, MariaDB.
 	DontSupportRenameColumn bool `json:"dont_support_rename_column" mapstructure:"dont_support_rename_column"`
-	// auto configure based on currently MySQL version
+	// Auto configure based on currently MySQL version.
 	SkipInitializeWithVersion bool `json:"skip_initialize_with_version" mapstructure:"skip_initialize_with_version"`
 }
 
@@ -45,34 +73,104 @@ type SQLPump struct {
 	db      *gorm.DB
 	dbType  string
 	dialect gorm.Dialector
+
+	// this channel is used to signal that the background index creation has finished - this is used for testing
+	backgroundIndexCreated chan bool
 }
 
+// @PumpConf SQL
 type SQLConf struct {
-	EnvPrefix        string         `mapstructure:"meta_env_prefix"`
-	Type             string         `json:"type" mapstructure:"type"`
-	ConnectionString string         `json:"connection_string" mapstructure:"connection_string"`
-	Postgres         PostgresConfig `json:"postgres" mapstructure:"postgres"`
-	Mysql            MysqlConfig    `json:"mysql" mapstructure:"mysql"`
-	TableSharding    bool           `json:"table_sharding" mapstructure:"table_sharding"`
-	LogLevel         string         `json:"log_level" mapstructure:"log_level"`
-	BatchSize        int            `json:"batch_size" mapstructure:"batch_size"`
+	// The prefix for the environment variables that will be used to override the configuration.
+	// Defaults to `TYK_PMP_PUMPS_SQL_META`
+	EnvPrefix string `mapstructure:"meta_env_prefix"`
+	// The only supported and tested types are `postgres` and `mysql`.
+	// From v1.12.0, we no longer support `sqlite` as a storage type.
+	Type string `json:"type" mapstructure:"type"`
+	// Specifies the connection string to the database.
+	ConnectionString string `json:"connection_string" mapstructure:"connection_string"`
+	// Postgres configurations.
+	Postgres PostgresConfig `json:"postgres" mapstructure:"postgres"`
+	// Mysql configurations.
+	Mysql MysqlConfig `json:"mysql" mapstructure:"mysql"`
+	// Specifies if all the analytics records are going to be stored in one table or in multiple
+	// tables (one per day). By default, `false`. If `false`, all the records are going to be
+	// stored in `tyk_aggregated` table. Instead, if it's `true`, all the records of the day are
+	// going to be stored in `tyk_aggregated_YYYYMMDD` table, where `YYYYMMDD` is going to change
+	// depending on the date.
+	TableSharding bool `json:"table_sharding" mapstructure:"table_sharding"`
+	// Specifies the SQL log verbosity. The possible values are: `info`,`error` and `warning`. By
+	// default, the value is `silent`, which means that it won't log any SQL query.
+	LogLevel string `json:"log_level" mapstructure:"log_level"`
+	// Specifies the amount of records that are going to be written each batch. Type int. By
+	// default, it writes 1000 records max per batch.
+	BatchSize int `json:"batch_size" mapstructure:"batch_size"`
+	// Specifies whether to migrate all existing sharded tables to latest schema during Pump initialization (default: false).
+	// When true, on initialization Pump will scan and migrate all sharded tables to the latest schema.
+	// When false, existing tables will not be migrated and may miss columns included in the latest schema.
+	// If there are a large number of existing tables, or those tables are in use by other services, there may be a performance impact from the migration. We recommend testing carefully.
+	MigrateShardedTables bool `json:"migrate_sharded_tables" mapstructure:"migrate_sharded_tables"`
 }
 
+var timeZoneMatcher = regexp.MustCompile("(time_zone|TimeZone)=(.*?)($|&| )")
+
+// monthEncodePlan converts time.Month to int for pgx encoding.
+// pgx v5's TryWrapBuiltinTypeEncodePlan matches time.Month as fmt.Stringer
+// (producing "May") before TryWrapFindUnderlyingTypeEncodePlan can convert it
+// to its underlying int. This plan is prepended to the encode chain so the
+// int conversion happens first. See TT-16980 and https://github.com/jackc/pgx/issues/2157
+type monthEncodePlan struct {
+	next pgtype.EncodePlan
+}
+
+func (p *monthEncodePlan) SetNext(next pgtype.EncodePlan) { p.next = next }
+
+func (p *monthEncodePlan) Encode(value any, buf []byte) ([]byte, error) {
+	return p.next.Encode(int(value.(time.Month)), buf)
+}
+
+// Dialect builds the gorm dialector for cfg. It does not apply the PostgreSQL
+// connection-pool settings held in cfg.Postgres — OpenGormDB applies those once the
+// *gorm.DB exists, so any caller that opens gorm itself must apply them too.
 func Dialect(cfg *SQLConf) (gorm.Dialector, error) {
 	switch cfg.Type {
-	case "sqlite":
-		if cfg.ConnectionString == "" {
-			log.Warning("`meta.connection_string` is empty. Falling back to in-memory storage. Warning: All data will be lost on process restart.")
-			cfg.ConnectionString = "file::memory:?cache=shared"
-		}
-
-		return sqlite.Open(cfg.ConnectionString), nil
 	case "postgres":
-		// Example connection_string: `"host=localhost user=gorm password=gorm DB.name=gorm port=9920 sslmode=disable TimeZone=Asia/Shanghai"`
-		return postgres.New(postgres.Config{
-			DSN:                  cfg.ConnectionString,
-			PreferSimpleProtocol: cfg.Postgres.PreferSimpleProtocol,
-		}), nil
+		// We build the *sql.DB ourselves instead of letting the gorm postgres
+		// driver do it. So we can inject an AfterConnect callback that registers
+		// time.Month as PostgreSQL int8. Without this, pgx v5's simple protocol
+		// encodes time.Month via String() ("May") instead of the underlying int,
+		// which PostgreSQL rejects for bigint columns.
+		// See TT-16980 and https://github.com/jackc/pgx/issues/2157
+		pgxConfig, err := pgx.ParseConfig(cfg.ConnectionString)
+		if err != nil {
+			return nil, err
+		}
+		if cfg.Postgres.PreferSimpleProtocol {
+			pgxConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+		}
+		// Replicate timezone handling from gorm.io/driver/postgres.
+		if result := timeZoneMatcher.FindStringSubmatch(cfg.ConnectionString); len(result) > 2 {
+			pgxConfig.RuntimeParams["timezone"] = result[2]
+		}
+		sqlDB := stdlib.OpenDB(*pgxConfig,
+			stdlib.OptionAfterConnect(func(ctx context.Context, conn *pgx.Conn) error {
+				tm := conn.TypeMap()
+				// Prepend a custom encode plan that converts time.Month to int
+				// before pgx's fmt.Stringer wrapper can fire.
+				tm.TryWrapEncodePlanFuncs = append(
+					[]pgtype.TryWrapEncodePlanFunc{
+						func(value any) (pgtype.WrappedEncodePlanNextSetter, any, bool) {
+							if m, ok := value.(time.Month); ok {
+								return &monthEncodePlan{}, int(m), true
+							}
+							return nil, nil, false
+						},
+					},
+					tm.TryWrapEncodePlanFuncs...,
+				)
+				return nil
+			}),
+		)
+		return postgres.New(postgres.Config{Conn: sqlDB}), nil
 	case "mysql":
 		return mysql.New(mysql.Config{
 			DSN:                       cfg.ConnectionString,
@@ -87,9 +185,23 @@ func Dialect(cfg *SQLConf) (gorm.Dialector, error) {
 	}
 }
 
-var SQLPrefix = "SQL-pump"
-var SQLDefaultENV = PUMPS_ENV_PREFIX + "_SQL" + PUMPS_ENV_META_PREFIX
-var SQLDefaultQueryBatchSize = 1000
+var (
+	SQLPrefix                = "SQL-pump"
+	SQLDefaultENV            = PUMPS_ENV_PREFIX + "_SQL" + PUMPS_ENV_META_PREFIX
+	SQLDefaultQueryBatchSize = 1000
+
+	indexes = []struct {
+		baseName string
+		column   string
+	}{
+		{"idx_responsecode", "responsecode"},
+		{"idx_apikey", "apikey"},
+		{"idx_timestamp", "timestamp"},
+		{"idx_apiid", "apiid"},
+		{"idx_orgid", "orgid"},
+		{"idx_oauthid", "oauthid"},
+	}
+)
 
 func (c *SQLPump) New() Pump {
 	newPump := SQLPump{}
@@ -102,6 +214,18 @@ func (c *SQLPump) GetName() string {
 
 func (c *SQLPump) GetEnvPrefix() string {
 	return c.SQLConf.EnvPrefix
+}
+
+func (c *SQLPump) SetDecodingRequest(decoding bool) {
+	if decoding {
+		log.WithField("pump", c.GetName()).Warn("Decoding request is not supported for SQL pump")
+	}
+}
+
+func (c *SQLPump) SetDecodingResponse(decoding bool) {
+	if decoding {
+		log.WithField("pump", c.GetName()).Warn("Decoding response is not supported for SQL pump")
+	}
 }
 
 func (c *SQLPump) Init(conf interface{}) error {
@@ -122,40 +246,30 @@ func (c *SQLPump) Init(conf interface{}) error {
 		processPumpEnvVars(c, c.log, c.SQLConf, SQLDefaultENV)
 	}
 
-	logLevel := gorm_logger.Silent
-
-	switch c.SQLConf.LogLevel {
-	case "debug":
-		logLevel = gorm_logger.Info
-	case "info":
-		logLevel = gorm_logger.Warn
-	case "warning":
-		logLevel = gorm_logger.Error
-	}
-
-	dialect, errDialect := Dialect(c.SQLConf)
-	if errDialect != nil {
-		c.log.Error(errDialect)
-		return errDialect
-	}
-
-	db, err := gorm.Open(dialect, &gorm.Config{
-		AutoEmbedd:  true,
-		UseJSONTags: true,
-		Logger:      gorm_logger.Default.LogMode(logLevel),
-	})
-
+	db, err := OpenGormDB(c.SQLConf, c.log)
 	if err != nil {
-		c.log.Error(err)
 		return err
 	}
 	c.db = db
 
-	if !c.SQLConf.TableSharding {
-		if c.IsUptime {
-			c.db.Table(analytics.UptimeSQLTable).AutoMigrate(&analytics.UptimeReportAggregateSQL{})
-		} else {
-			c.db.Table(analytics.SQLTable).AutoMigrate(&analytics.AnalyticsRecord{})
+	// Handle table migration based on configuration
+	if c.IsUptime {
+		// Create migration function for uptime sharded tables
+		migrateShardedTables := func() error {
+			return MigrateAllShardedTables(c.db, analytics.UptimeSQLTable, "uptime", &analytics.UptimeReportAggregateSQL{}, c.log)
+		}
+
+		if err := HandleTableMigration(c.db, c.SQLConf, analytics.UptimeSQLTable, &analytics.UptimeReportAggregateSQL{}, c.log, migrateShardedTables); err != nil {
+			return err
+		}
+	} else {
+		// Create migration function for analytics sharded tables
+		migrateShardedTables := func() error {
+			return MigrateAllShardedTables(c.db, analytics.SQLTable, "", &analytics.AnalyticsRecord{}, c.log)
+		}
+
+		if err := HandleTableMigration(c.db, c.SQLConf, analytics.SQLTable, &analytics.AnalyticsRecord{}, c.log, migrateShardedTables); err != nil {
+			return err
 		}
 	}
 
@@ -174,25 +288,32 @@ func (c *SQLPump) WriteData(ctx context.Context, data []interface{}) error {
 	for _, r := range data {
 		if r != nil {
 			rec := r.(analytics.AnalyticsRecord)
+			// MCP records are handled by dedicated MCP pumps, skip them here.
+			if rec.IsMCPRecord() {
+				continue
+			}
 			typedData = append(typedData, &rec)
 		}
 	}
 	dataLen := len(typedData)
+	if dataLen == 0 {
+		return nil
+	}
 
 	startIndex := 0
 	endIndex := dataLen
-	//We iterate dataLen +1 times since we're writing the data after the date change on sharding_table:true
+	// We iterate dataLen +1 times since we're writing the data after the date change on sharding_table:true
 	for i := 0; i <= dataLen; i++ {
-		if c.SQLConf.TableSharding {
+		if c.SQLConf.TableSharding && startIndex < len(typedData) {
 			recDate := typedData[startIndex].TimeStamp.Format("20060102")
 			var nextRecDate string
-			//if we're on i == dataLen iteration, it means that we're out of index range. We're going to use the last record date.
+			// if we're on i == dataLen iteration, it means that we're out of index range. We're going to use the last record date.
 			if i == dataLen {
 				nextRecDate = typedData[dataLen-1].TimeStamp.Format("20060102")
 			} else {
 				nextRecDate = typedData[i].TimeStamp.Format("20060102")
 
-				//if both dates are equal, we shouldn't write in the table yet.
+				// if both dates are equal, we shouldn't write in the table yet.
 				if recDate == nextRecDate {
 					continue
 				}
@@ -202,8 +323,8 @@ func (c *SQLPump) WriteData(ctx context.Context, data []interface{}) error {
 
 			table := analytics.SQLTable + "_" + recDate
 			c.db = c.db.Table(table)
-			if !c.db.Migrator().HasTable(table) {
-				c.db.AutoMigrate(&analytics.AnalyticsRecord{})
+			if errTable := c.ensureTable(table); errTable != nil {
+				return errTable
 			}
 		} else {
 			i = dataLen // write all records at once for non-sharded case, stop for loop after 1 iteration
@@ -226,7 +347,7 @@ func (c *SQLPump) WriteData(ctx context.Context, data []interface{}) error {
 
 	}
 
-	c.log.Info("Purged ", len(data), " records...")
+	c.log.Info("Purged ", dataLen, " records...")
 
 	return nil
 }
@@ -240,6 +361,7 @@ func (c *SQLPump) WriteUptimeData(data []interface{}) {
 	for i, v := range data {
 		decoded := analytics.UptimeReportData{}
 		if err := msgpack.Unmarshal([]byte(v.(string)), &decoded); err != nil {
+			// ToDo: should this work with serializer?
 			c.log.Error("Couldn't unmarshal analytics data:", err)
 			continue
 		}
@@ -258,13 +380,13 @@ func (c *SQLPump) WriteUptimeData(data []interface{}) {
 		if c.SQLConf.TableSharding {
 			recDate := typedData[startIndex].TimeStamp.Format("20060102")
 			var nextRecDate string
-			//if we're on i == dataLen iteration, it means that we're out of index range. We're going to use the last record date.
+			// if we're on i == dataLen iteration, it means that we're out of index range. We're going to use the last record date.
 			if i == dataLen {
 				nextRecDate = typedData[dataLen-1].TimeStamp.Format("20060102")
 			} else {
 				nextRecDate = typedData[i].TimeStamp.Format("20060102")
 
-				//if both dates are equal, we shouldn't write in the table yet.
+				// if both dates are equal, we shouldn't write in the table yet.
 				if recDate == nextRecDate {
 					continue
 				}
@@ -304,6 +426,10 @@ func (c *SQLPump) WriteUptimeData(data []interface{}) {
 				recs = append(recs, rec)
 			}
 
+			// recs is rebuilt per org and per day-shard, so this must stay in the innermost
+			// scope: hoisting it out would leave later orgs and shards unsorted.
+			sortByID(recs, func(r analytics.UptimeReportAggregateSQL) string { return r.ID })
+
 			for i := 0; i < len(recs); i += c.SQLConf.BatchSize {
 				ends := i + c.SQLConf.BatchSize
 				if ends > len(recs) {
@@ -323,5 +449,107 @@ func (c *SQLPump) WriteUptimeData(data []interface{}) {
 	}
 
 	c.log.Debug("Purged ", len(data), " records...")
+}
 
+// sortByID orders a batch of rows by primary key before it is upserted. PostgreSQL takes
+// row locks in statement order, and the rows are built by ranging over maps, so without a
+// fixed order every pump replica locks overlapping IDs in a different sequence and
+// concurrent upserts deadlock with SQLSTATE 40P01 (TT-9424). Every SQL write path that
+// upserts a batch must call this first.
+func sortByID[T any](recs []T, id func(T) string) {
+	slices.SortFunc(recs, func(a, b T) int { return cmp.Compare(id(a), id(b)) })
+}
+
+func (c *SQLPump) buildIndexName(indexBaseName, tableName string) string {
+	return fmt.Sprintf("%s_%s", tableName, indexBaseName)
+}
+
+func (c *SQLPump) createIndex(indexBaseName, tableName, column string) error {
+	indexName := c.buildIndexName(indexBaseName, tableName)
+	option := ""
+	if c.dbType == "postgres" {
+		option = "CONCURRENTLY"
+	}
+
+	columnExist := c.db.Migrator().HasColumn(&analytics.AnalyticsRecord{}, column)
+	if !columnExist {
+		return errors.New("cannot create index for non existent column " + column)
+	}
+
+	query := fmt.Sprintf("CREATE INDEX %s IF NOT EXISTS %s ON %s (%s)", option, indexName, tableName, column)
+
+	err := c.db.Exec(query).Error
+	if err != nil {
+		c.log.WithFields(logrus.Fields{
+			"index": indexName,
+			"table": tableName,
+		}).WithError(err).Error("Error creating index")
+		return err
+	}
+
+	c.log.Infof("Index %s created for table %s", indexName, tableName)
+	c.log.WithFields(logrus.Fields{
+		"index": indexName,
+		"table": tableName,
+	}).Info("Index created")
+	return nil
+}
+
+// ensureIndex check that all indexes for the analytics SQL table are in place
+func (c *SQLPump) ensureIndex(tableName string, background bool) error {
+	if !c.db.Migrator().HasTable(tableName) {
+		return errors.New("cannot create indexes as table doesn't exist: " + tableName)
+	}
+
+	// waitgroup to facilitate testing and track when all indexes are created
+	var wg sync.WaitGroup
+	if background {
+		wg.Add(len(indexes))
+	}
+
+	for _, idx := range indexes {
+		indexName := tableName + idx.baseName
+
+		if c.db.Migrator().HasIndex(tableName, indexName) {
+			c.log.WithFields(logrus.Fields{
+				"index": indexName,
+				"table": tableName,
+			}).Info("Index already exists")
+			continue
+		}
+
+		if background {
+			go func(baseName, cols string) {
+				defer wg.Done()
+				if err := c.createIndex(baseName, tableName, cols); err != nil {
+					c.log.Error(err)
+				}
+			}(idx.baseName, idx.column)
+		} else {
+			if err := c.createIndex(idx.baseName, tableName, idx.column); err != nil {
+				return err
+			}
+		}
+	}
+
+	if background {
+		wg.Wait()
+		c.backgroundIndexCreated <- true
+	}
+	return nil
+}
+
+// ensureTable creates the table if it doesn't exist
+func (c *SQLPump) ensureTable(tableName string) error {
+	if !c.db.Migrator().HasTable(tableName) {
+		c.db = c.db.Table(tableName)
+		if err := c.db.Migrator().CreateTable(&analytics.AnalyticsRecord{}); err != nil {
+			c.log.Error("error creating table", err)
+			return err
+		}
+		if err := c.ensureIndex(tableName, false); err != nil {
+			return err
+		}
+	}
+	return nil
 }

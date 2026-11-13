@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"strings"
 
+	"github.com/TykTechnologies/storage/kv"
+	"github.com/TykTechnologies/tyk-pump/logger"
 	"github.com/TykTechnologies/tyk-pump/pumps"
 	"github.com/kelseyhightower/envconfig"
 
@@ -19,51 +22,278 @@ const PUMPS_ENV_PREFIX = pumps.PUMPS_ENV_PREFIX
 const PUMPS_ENV_META_PREFIX = pumps.PUMPS_ENV_META_PREFIX
 
 type PumpConfig struct {
-	Name                  string                     `json:"name"` // Deprecated
-	Type                  string                     `json:"type"`
-	Filters               analytics.AnalyticsFilters `json:"filters"`
-	Timeout               int                        `json:"timeout"`
-	OmitDetailedRecording bool                       `json:"omit_detailed_recording"`
-	MaxRecordSize         int                        `json:"max_record_size"` // in bytes
-	Meta                  map[string]interface{}     `json:"meta"`            // TODO: convert this to json.RawMessage and use regular json.Unmarshal
+	// The name of the pump. This is used to identify the pump in the logs.
+	// Deprecated, use `type` instead.
+	Name string `json:"name"`
+	// Sets the pump type. This is needed when the pump key does not equal to the pump name type.
+	// Current valid types are: `mongo`, `mongo-pump-selective`, `mongo-pump-aggregate`, `csv`,
+	// `elasticsearch`, `influx`, `influx2`, `moesif`, `statsd`, `segment`, `graylog`, `splunk`, `hybrid`, `prometheus`,
+	// `logzio`, `dogstatsd`, `kafka`, `syslog`, `sql`, `sql_aggregate`, `stdout`, `timestream`, `mongo-graph`,
+	// `sql-graph`, `sql-graph-aggregate`, `resurfaceio`.
+	Type string `json:"type"`
+	// This feature adds a new configuration field in each pump called filters and its structure is
+	// the following:
+	// ```{.json}
+	// "filters":{
+	//   "api_ids":[],
+	//   "org_ids":[],
+	//   "response_codes":[],
+	//   "skip_api_ids":[],
+	//   "skip_org_ids":[],
+	//   "skip_response_codes":[]
+	// }
+	// ```
+	// The fields api_ids, org_ids and response_codes works as allow list (APIs and orgs where we
+	// want to send the analytics records) and the fields skip_api_ids, skip_org_ids and
+	// skip_response_codes works as block list.
+	//
+	// The priority is always block list configurations over allow list.
+	//
+	// An example of configuration would be:
+	// ```{.json}
+	// "csv": {
+	//  "type": "csv",
+	//  "filters": {
+	//    "org_ids": ["org1","org2"]
+	//  },
+	//  "meta": {
+	//    "csv_dir": "./bar"
+	//  }
+	// }
+	// ```
+	Filters analytics.AnalyticsFilters `json:"filters"`
+	// By default, a pump will wait forever for each write operation to complete; you can configure an optional timeout by setting the configuration option `timeout`.
+	// If you have deployed multiple pumps, then you can configure each timeout independently. The timeout is in seconds and defaults to 0.
+	//
+	// The timeout is configured within the main pump config as shown here; note that this example would configure a 5 second timeout:
+	// ```{.json}
+	// "pump_name": {
+	//   ...
+	//   "timeout":5,
+	//   "meta": {...}
+	// }
+	// ```
+	//
+	// Tyk will inform you if the pump's write operation is taking longer than the purging loop (configured via `purge_delay`) as this will mean that data is purged before being written to the target data sink.
+	//
+	// If there is no timeout configured and pump's write operation is taking longer than the purging loop, the following warning log will be generated:
+	// `Pump {pump_name} is taking more time than the value configured of purge_delay. You should try to set a timeout for this pump.`
+	//
+	// If there is a timeout configured, but pump's write operation is still taking longer than the purging loop, the following warning log will be generated:
+	// `Pump {pump_name} is taking more time than the value configured of purge_delay. You should try lowering the timeout configured for this pump.`.
+	Timeout int `json:"timeout"`
+	// Reduce the size of the traffic logs generated for each request by setting this to `true`. This Pump will
+	// then not include the request or response body in the logs. Defaults to `false`.
+	//
+	// This setting has no effect for aggregate pumps used to generate [Tyk Dashboard Analytics](/api-management/dashboard-analytics) which do not directly transmit the Traffic Logs.
+	OmitDetailedRecording bool `json:"omit_detailed_recording"`
+	// Defines maximum size (in bytes) of an individual Traffic Log that this Pump will transfer.
+	//
+	// This is useful when using Detailed Recording to capture the request and response payloads in the Traffic Log, to avoid overloading the logging databases. Pump will trim the log to the maximum configured size.
+	// If omitted or set to 0 (default) then Pump will transfer the full Traffic Log.
+	//
+	// This setting has no effect for aggregate pumps used to generate [Tyk Dashboard Analytics](/api-management/dashboard-analytics) which do not directly transmit the Traffic Logs.
+	MaxRecordSize int `json:"max_record_size"`
+	// IgnoreFields defines a list of analytics fields that will be ignored when writing to the pump.
+	// This can be used to avoid writing sensitive information to the Database, or data that you don't really need to have.
+	// The field names must be the same as the JSON tags of the analytics record fields.
+	// For example: `["api_key", "api_version"]`.
+	IgnoreFields []string `json:"ignore_fields"`
+	// Meta is a map of configuration values that are specific to each pump. For example, the
+	// `csv` pump requires a `csv_dir` value to be set, that need to be set in the `meta` map.
+	Meta map[string]interface{} `json:"meta"`
+	// Setting this to true allows the Raw Request to be decoded from base 64 for all pumps. This is set to false by default.
+	DecodeRawRequest bool `json:"raw_request_decoded"`
+	// Setting this to true allows the Raw Response to be decoded from base 64 for all pumps. This is set to false by default.
+	DecodeRawResponse bool `json:"raw_response_decoded"`
 }
 
 type UptimeConf struct {
+	// TYKCONFIGHEADERSTART
+	// HEADER Mongo Uptime Pump
+	// In `uptime_pump_config` you can configure a mongo uptime pump. By default, the uptime pump
+	// is going to be `mongo` type, so it's not necessary to specify it here. The minimum required
+	// configurations for uptime pumps are:
+	//
+	// * `collection_name` - That determines the uptime collection name in mongo. By default,
+	// `tyk_uptime_analytics`.
+	// * `mongo_url` - The uptime pump mongo connection url. It is usually something like
+	// "mongodb://username:password@{hostname:port},{hostname:port}/{db_name}".
+	// TYKCONFIGHEADEREND
+	// TYKCONFIGEXPAND
 	pumps.MongoConf
+	// TYKCONFIGHEADERSTART
+	// HEADER SQL Uptime Pump
+	// *Supported in Tyk Pump v1.5.0+*
+	//
+	// In `uptime_pump_config` you can configure a SQL uptime pump. To do that, you need to add the
+	// field `uptime_type` with `sql` value. You can also use different types of SQL Uptime pumps,
+	// like `postgres` using the `type` field.
+	//
+	// An example of a SQL Postgres uptime pump would be:
+	// ```{.json}
+	// "uptime_pump_config": {
+	//     "uptime_type": "sql",
+	//     "type": "postgres",
+	//     "connection_string": "host=sql_host port=sql_port user=sql_usr dbname=dbname password=sql_pw",
+	//     "table_sharding": false
+	// },
+	// ```
+	//
+	// Take into account that you can also set `log_level` field into the `uptime_pump_config` to `debug`,
+	// `info` or `warning`. By default, the SQL logger verbosity is `silent`.
+	// TYKCONFIGHEADEREND
+	// TYKCONFIGEXPAND
 	pumps.SQLConf
+	// Determines the uptime type. Options are `mongo` and `sql`. Defaults to `mongo`.
 	UptimeType string `json:"uptime_type"`
 }
 
 type TykPumpConfiguration struct {
-	PurgeDelay              int                        `json:"purge_delay"`
-	PurgeChunk              int64                      `json:"purge_chunk"`
-	StorageExpirationTime   int64                      `json:"storage_expiration_time"`
-	DontPurgeUptimeData     bool                       `json:"dont_purge_uptime_data"`
-	UptimePumpConfig        UptimeConf                 `json:"uptime_pump_config"`
-	Pumps                   map[string]PumpConfig      `json:"pumps"`
-	AnalyticsStorageType    string                     `json:"analytics_storage_type"`
-	AnalyticsStorageConfig  storage.RedisStorageConfig `json:"analytics_storage_config"`
-	StatsdConnectionString  string                     `json:"statsd_connection_string"`
-	StatsdPrefix            string                     `json:"statsd_prefix"`
-	LogLevel                string                     `json:"log_level"`
-	LogFormat               string                     `json:"log_format"`
-	HealthCheckEndpointName string                     `json:"health_check_endpoint_name"`
-	HealthCheckEndpointPort int                        `json:"health_check_endpoint_port"`
-	OmitDetailedRecording   bool                       `json:"omit_detailed_recording"`
-	MaxRecordSize           int                        `json:"max_record_size"` // in bytes
+	// The maximum number of records to pull from Redis at a time. If it's unset or `0`, all the
+	// analytics records in Redis are pulled. If it's set, `storage_expiration_time` is used to
+	// reset the analytics record TTL.
+	PurgeChunk int64 `json:"purge_chunk"`
+	// The number of seconds for the analytics records TTL. It only works if `purge_chunk` is
+	// enabled. Defaults to `60` seconds.
+	StorageExpirationTime int64 `json:"storage_expiration_time"`
+
+	// Example Uptime Pump configuration:
+	// ```{.json}
+	// "uptime_pump_config": {
+	//   "uptime_type": "mongo",
+	//   "mongo_url": "mongodb://localhost:27017",
+	//   "collection_name": "tyk_uptime_analytics"
+	// },
+	UptimePumpConfig UptimeConf `json:"uptime_pump_config"`
+	// The default environment variable prefix for each pump follows this format:
+	// `TYK_PMP_PUMPS_{PUMP-NAME}_`, for example `TYK_PMP_PUMPS_KAFKA_`.
+	//
+	// You can also set custom names for each pump specifying the pump type. For example, if you
+	// want a Kafka pump which is called `PROD` you need to create `TYK_PMP_PUMPS_PROD_TYPE=kafka`
+	// and configure it using the `TYK_PMP_PUMPS_PROD_` prefix.
+	Pumps map[string]PumpConfig `json:"pumps"`
+	// Example Temporal storage configuration:
+	// ```{.json}
+	//   "analytics_storage_config": {
+	//     "type": "redis",
+	//     "host": "localhost",
+	//     "port": 6379,
+	//     "hosts": null,
+	//     "username": "",
+	//     "password": "",
+	//     "database": 0,
+	//     "optimisation_max_idle": 100,
+	//     "optimisation_max_active": 0,
+	//     "enable_cluster": false,
+	//     "use_ssl": false,
+	//     "ssl_insecure_skip_verify": false
+	//   },
+	// ```
+	AnalyticsStorageConfig storage.TemporalStorageConfig `json:"analytics_storage_config"`
+
+	// Sets the type of storage from which the Pump will fetch data.
+	// The supported value is `redis`, which covers both Redis and the Redis-compatible Valkey.
+	// Pump will default to assume Redis if no alternative is provided, so this configuration can be ignored at present.
+	AnalyticsStorageType string `json:"analytics_storage_type"`
+	// Connection string for StatsD monitoring for information please see the
+	// [Instrumentation docs](/api-management/logs-metrics).
+	StatsdConnectionString string `json:"statsd_connection_string"`
+	// Custom prefix value. For example separate settings for production and staging.
+	StatsdPrefix string `json:"statsd_prefix"`
+	// Set the logger details for tyk-pump. The posible values are: `info`,`debug`,`error` and
+	// `warn`. By default, the log level is `info`.
+	LogLevel string `json:"log_level"`
+	// Configures the output format used for application logs.
+	// Allowed values are `text`, `json`, or `legacy`.
+	// If not set or left empty, it defaults to `text`.
+	LogFormat logger.Format `json:"log_format"`
+	// TYKCONFIGHEADERSTART
+	// HEADER Health Check
+	// From v2.9.4, we have introduced a `/health` endpoint to confirm the Pump is running. You
+	// need to configure the following settings. This returns a HTTP 200 OK response if the Pump is
+	// running.
+	// TYKCONFIGHEADEREND
+	// The default is "hello".
+	HealthCheckEndpointName string `json:"health_check_endpoint_name"`
+
+	// Controls the frequency at which Tyk Pump should perform regular collection and purge
+	// of traffic logs from the temporal storage (typically Redis). Set the time between purges (in seconds).
+	// Be careful to ensure that this is long enough for the transfer of records to the target data sink (e.g.
+	// persistent storage or external APM) to complete to avoid data loss, but short enough to optimise
+	// your temporal storage size.
+	PurgeDelay int `json:"purge_delay"`
+	// The default port is 8083.
+	HealthCheckEndpointPort int `json:"health_check_endpoint_port"`
+	// Defines maximum size (in bytes) for Raw Request and Raw Response logs, this value defaults
+	// to 0. If it is not set then tyk-pump will not trim any data and will store the full
+	// information. This can also be set at a pump level. For example:
+	// ```{.json}
+	// "csv": {
+	//   "type": "csv",
+	//   "max_record_size":1000,
+	//   "meta": {
+	//     "csv_dir": "./"
+	//   }
+	// }
+	// ```
+	MaxRecordSize int `json:"max_record_size"`
+
+	// A default Uptime Pump will transfer uptime metrics which are used by Tyk Dashboard.
+	// If this is not required, you can disable that Pump by setting this option to `true`.
+	DontPurgeUptimeData bool `json:"dont_purge_uptime_data"`
+	// Reduce the size of the traffic logs generated for each request by setting this to true. Tyk Pump will
+	// then not include the `raw_request` and `raw_response` in the logs. Defaults to false.
+	OmitDetailedRecording bool `json:"omit_detailed_recording"`
+	// Defines if tyk-pump should ignore all the values in configuration file. Specially useful when setting all configurations in environment variables.
+	OmitConfigFile bool `json:"omit_config_file"`
+	// Expose profiling information to support debugging of Tyk Pump. This operates in the same way as for Tyk Gateway, as explained [here](/api-management/troubleshooting-debugging).
+	HTTPProfile bool `json:"enable_http_profiler"`
+	// This option was intended to decode raw request payloads from base64 for all Pumps. However, it was never implemented and therefore has no functional effect. It has now been deprecated.
+	// for all pumps. This is set to false by default.
+	// Deprecated: Use pump level raw_request_decoded configuration instead.
+	DecodeRawRequest bool `json:"raw_request_decoded"`
+	// This option was intended to decode raw response payloads from base64 for all Pumps. However, it was never implemented and therefore has no functional effect. It has now been deprecated.
+	// Deprecated: Use pump level raw_response_decoded configuration instead.
+	DecodeRawResponse bool `json:"raw_response_decoded"`
+
+	// KV defines named secret stores (such as HashiCorp Vault, Consul, environment
+	// variables, or inline values) that other configuration values can reference.
+	// This lets sensitive settings like database credentials or the admin secret
+	// be kept in an external store instead of the config file; each referenced
+	// value is resolved from its store once, at startup. Store definitions may be
+	// set in the config file or supplied as a JSON object through the
+	// TYK_PMP_KV_STORES environment variable; the environment overrides and adds
+	// stores by name, leaving file-defined stores it does not name untouched.
+	KV kv.Config `json:"kv"`
 }
 
-func LoadConfig(filePath *string, configStruct *TykPumpConfiguration) {
+// LoadConfig populates configStruct from the config file and the environment, then
+// dereferences any KV reference it holds.
+//
+// It returns the KV stores the resolution ran against, still open, because the pump
+// specific env var overrides resolve against them later - see initialisePumps. The
+// caller must Close them once every pump is up. The result is nil when the config
+// declares no KV stores, and Close is safe on nil.
+func LoadConfig(filePath *string, configStruct *TykPumpConfiguration) *kvStores {
+	if !configStruct.shouldOmitConfigFile() {
+		configuration, err := ioutil.ReadFile(*filePath)
+		if err != nil {
+			log.Error("Couldn't load configuration file: ", err)
+		}
 
-	configuration, err := ioutil.ReadFile(*filePath)
-	if err != nil {
-		log.Error("Couldn't load configuration file: ", err)
+		marshalErr := json.Unmarshal(configuration, &configStruct)
+		if marshalErr != nil {
+			log.Error("Couldn't unmarshal configuration: ", marshalErr)
+		}
 	}
 
-	marshalErr := json.Unmarshal(configuration, &configStruct)
-	if marshalErr != nil {
-		log.Error("Couldn't unmarshal configuration: ", marshalErr)
+	toUpperMap := make(map[string]PumpConfig)
+	for pumpName := range configStruct.Pumps {
+		upperPumpName := strings.ToUpper(pumpName)
+		toUpperMap[upperPumpName] = configStruct.Pumps[pumpName]
 	}
+	configStruct.Pumps = toUpperMap
 
 	overrideErr := envconfig.Process(ENV_PREVIX, configStruct)
 	if overrideErr != nil {
@@ -72,8 +302,20 @@ func LoadConfig(filePath *string, configStruct *TykPumpConfiguration) {
 
 	errLoadEnvPumps := configStruct.LoadPumpsByEnv()
 	if errLoadEnvPumps != nil {
-		log.Fatal("error loading pumps env vars:", err)
+		log.Fatal("error loading pumps env vars:", errLoadEnvPumps)
 	}
+
+	stores, err := resolveKVReferences(context.Background(), configStruct)
+	if err != nil {
+		log.Fatalf("Failed to resolve config: %v", err)
+	}
+
+	return stores
+}
+
+func (cfg *TykPumpConfiguration) shouldOmitConfigFile() bool {
+	shouldOmit, omitEnvExist := os.LookupEnv(ENV_PREVIX + "_OMITCONFIGFILE")
+	return omitEnvExist && strings.EqualFold(shouldOmit, "true")
 }
 
 func (cfg *TykPumpConfiguration) LoadPumpsByEnv() error {
@@ -86,7 +328,6 @@ func (cfg *TykPumpConfiguration) LoadPumpsByEnv() error {
 	//first we look for all the pumps names in the env vars from the os
 	for _, env := range os.Environ() {
 		if strings.HasPrefix(env, PUMPS_ENV_PREFIX) {
-
 			// We trim everything after PUMPS_ENV_PREFIX. For example, if we have TYK_PUMP_PUMPS_CSV_TYPE we would have CSV_TYPE here
 			envWoPrefix := strings.TrimPrefix(env, PUMPS_ENV_PREFIX+"_")
 
@@ -98,8 +339,7 @@ func (cfg *TykPumpConfiguration) LoadPumpsByEnv() error {
 			}
 
 			//The name of the pump is always going to be the first keyword after the PUMPS_ENV_PREFIX
-			pmpName := envSplit[0]
-
+			pmpName := strings.ToUpper(envSplit[0])
 			osPumpsEnvNames[pmpName] = true
 		}
 	}
@@ -114,18 +354,21 @@ func (cfg *TykPumpConfiguration) LoadPumpsByEnv() error {
 			pmp = jsonPump
 		}
 		//We look if the pmpName is one of our available pumps. If it's not, we look if the env with the TYPE filed exists.
+		var pmpType string
 		if _, ok := pumps.AvailablePumps[strings.ToLower(pmpName)]; !ok {
-			pmpType, found := os.LookupEnv(PUMPS_ENV_PREFIX + "_" + pmpName + "_TYPE")
+			var found bool
+			pmpType, found = os.LookupEnv(PUMPS_ENV_PREFIX + "_" + pmpName + "_TYPE")
 			if !found {
-				log.Error(fmt.Sprintf("TYPE Env var for pump %s not found", pmpName))
-				continue
+				if pmp.Type == "" {
+					log.Error(fmt.Sprintf("TYPE Env var for pump %s not found", pmpName))
+					continue
+				}
+				pmpType = pmp.Type
 			}
-			pmp.Type = pmpType
 		} else {
-			pmp.Type = pmpName
+			pmpType = pmpName
 		}
 
-		pmpType := pmp.Type
 		//We fetch the env vars for that pump.
 		overrideErr := envconfig.Process(PUMPS_ENV_PREFIX+"_"+pmpName, &pmp)
 		if overrideErr != nil {
